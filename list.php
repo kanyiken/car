@@ -46,6 +46,13 @@ $uploadBaseDir = __DIR__ . "/uploads";
 $uploadListingsDir = $uploadBaseDir . "/listings";
 $uploadUrlPrefix = "/uploads/listings";
 
+/** Notifications */
+const ADMIN_PHONE = "+254790807760";
+const SITE_URL = "http://localhost:8888/car";
+const AT_USERNAME = "amisend";
+const AT_API_KEY = "atsk_ccecd4b1304fc5ce9111442d8b601395b637961b89d7b7af9d9af062162132b73bdcb8d";
+const AT_SENDER = "AzaHub";
+
 /* =========================
    1) HARDEN OUTPUT (JSON SAFETY)
    ========================= */
@@ -83,8 +90,28 @@ function ensure_dir(string $path): void {
   $idx = rtrim($path, "/") . "/index.html";
   if (!file_exists($idx)) @file_put_contents($idx, "");
 }
+function ensure_notifications_table(): void {
+  static $done = false;
+  if ($done) return;
+  $sql = "
+    CREATE TABLE IF NOT EXISTS notifications (
+      id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+      recipient_phone varchar(32) NOT NULL,
+      body text NOT NULL,
+      meta json DEFAULT NULL,
+      status enum('pending','sent','failed') NOT NULL DEFAULT 'pending',
+      created_at datetime NOT NULL DEFAULT current_timestamp(),
+      sent_at datetime DEFAULT NULL,
+      PRIMARY KEY (id),
+      KEY idx_notifications_recipient_phone (recipient_phone)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  ";
+  db()->exec($sql);
+  $done = true;
+}
 ensure_dir($uploadBaseDir);
 ensure_dir($uploadListingsDir);
+ensure_notifications_table();
 
 /* =========================
    3) DB + HELPERS (SCHEMA-TRUTH)
@@ -256,6 +283,84 @@ function event_log(string $type, array $ids=[], array $meta=[]): void {
   ]);
 }
 
+function queue_notification(string $phone, string $message, array $meta=[]): void {
+  $phone = clean_str($phone, 40);
+  $message = trim((string)$message);
+  if ($phone === "" || $message === "") return;
+  $pdo = db();
+  $st = $pdo->prepare("
+    INSERT INTO notifications(recipient_phone, body, meta, status, created_at)
+    VALUES(?,?,?,?,?)
+  ");
+  $st->execute([
+    $phone,
+    $message,
+    $meta ? json_encode($meta, JSON_UNESCAPED_UNICODE) : null,
+    'pending',
+    now_utc()
+  ]);
+  $id = (int)$pdo->lastInsertId();
+  $sendResult = send_africastalking_sms($phone, $message);
+  $status = $sendResult['ok'] ? 'sent' : 'failed';
+  $sentAt = $sendResult['ok'] ? now_utc() : null;
+  update_notification_status($id, $status, $sentAt);
+  if (!$sendResult['ok']){
+    event_log("notification_failed", ["dealer_id"=>$meta["dealer_id"] ?? null], [
+      "recipient"=>$phone,
+      "error"=>$sendResult['error'] ?? 'AfricasTalking send failed',
+      "meta"=>$meta
+    ]);
+  }
+}
+
+function update_notification_status(int $id, string $status, ?string $sentAt=null): void {
+  if ($id <= 0) return;
+  $pdo = db();
+  $st = $pdo->prepare("UPDATE notifications SET status=?, sent_at=? WHERE id=?");
+  $st->execute([$status, $sentAt, $id]);
+}
+
+function send_africastalking_sms(string $phone, string $message): array {
+  if (AT_USERNAME === "" || AT_API_KEY === "") {
+    return ["ok"=>false, "error"=>"AfricasTalking credentials missing"];
+  }
+  $payload = http_build_query([
+    "username" => AT_USERNAME,
+    "message" => $message,
+    "to" => $phone,
+    "from" => AT_SENDER
+  ]);
+  $ch = curl_init("https://api.africastalking.com/version1/messaging");
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => $payload,
+    CURLOPT_HTTPHEADER => [
+      "Accept: application/json",
+      "apiKey: " . AT_API_KEY,
+      "Content-Type: application/x-www-form-urlencoded"
+    ],
+    CURLOPT_TIMEOUT => 15,
+    CURLOPT_CONNECTTIMEOUT => 10,
+  ]);
+  $response = curl_exec($ch);
+  $err = curl_error($ch);
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+  if ($err) return ["ok"=>false, "error"=>$err];
+  if ($code < 200 || $code >= 300) return ["ok"=>false, "error"=>"HTTP {$code}: {$response}"];
+  $data = @json_decode($response, true);
+  if (!is_array($data)) return ["ok"=>false, "error"=>"Invalid JSON: {$response}"];
+  $recipient = $data["SMSMessageData"]["Recipients"][0] ?? null;
+  if (!$recipient || !isset($recipient["status"])) {
+    return ["ok"=>false, "error"=>"No recipient status"];
+  }
+  if (strtolower($recipient["status"]) !== "success") {
+    return ["ok"=>false, "error"=>$recipient["status"] ?? "failed"];
+  }
+  return ["ok"=>true, "result"=>$recipient["status"]];
+}
+
 /* =========================
    5) ONE-TIME SEED (FEATURES)
    ========================= */
@@ -329,7 +434,7 @@ if ($action === "models") {
 if ($action === "model_years") {
   $modelId = (int)($_GET["model_id"] ?? 0);
   if ($modelId <= 0) json_out(["ok"=>false,"error"=>"model_id required"], 422);
-  $st = db()->prepare("SELECT year FROM vehicle_model_years WHERE model_id=? ORDER BY year ASC");
+  $st = db()->prepare("SELECT year FROM vehicle_model_years WHERE model_id=? ORDER BY year DESC");
   $st->execute([$modelId]);
   $years = array_map("intval", array_column($st->fetchAll(), "year"));
   json_out(["ok"=>true, "years"=>$years]);
@@ -348,6 +453,39 @@ if ($action === "options_get") {
   if (!is_array($featuresArr)) $featuresArr = [];
 
   json_out(["ok"=>true, "features"=>$featuresArr]);
+}
+if ($action === "price_stats") {
+  $modelId = (int)($_GET["vehicle_model_id"] ?? 0);
+  if ($modelId <= 0) json_out(["ok"=>false,"error"=>"vehicle_model_id required"], 422);
+  $year = intv($_GET["year"] ?? null, 1900, 2100);
+
+  $sql = "
+    SELECT
+      COUNT(*) AS total_listings,
+      MIN(cash_price_kes) AS min_price,
+      MAX(cash_price_kes) AS max_price,
+      AVG(cash_price_kes) AS avg_price
+    FROM listings
+    WHERE vehicle_model_id = ?
+      AND cash_price_kes > 0
+      AND approval_status IN ('approved','pending')
+  ";
+  $params = [$modelId];
+  if ($year) {
+    $sql .= " AND year = ?";
+    $params[] = $year;
+  }
+  $pdo = db();
+  $st = $pdo->prepare($sql);
+  $st->execute($params);
+  $row = $st->fetch() ?: [];
+  $stats = [
+    "count" => (int)($row["total_listings"] ?? 0),
+    "min" => isset($row["min_price"]) ? (int)$row["min_price"] : null,
+    "max" => isset($row["max_price"]) ? (int)$row["max_price"] : null,
+    "avg" => isset($row["avg_price"]) ? (int)round((float)$row["avg_price"]) : null,
+  ];
+  json_out(["ok"=>true, "stats"=>$stats]);
 }
 
 /* ---------- DB adds (Title Case enforced) ---------- */
@@ -513,15 +651,20 @@ if ($action === "dealer_lookup") {
     INSERT INTO users(role, created_by, full_name, phone_e164, email, password_hash, is_active, created_at)
     VALUES('dealer', NULL, ?, ?, NULL, ?, 1, ?)
   ");
+  $created = false;
 
   try {
     $ins->execute([$name, $phone, $passwordHash, now_utc()]);
+    $created = true;
   } catch (Throwable $e) {
     json_out(["ok"=>false,"error"=>"Failed to create dealer"], 409);
   }
 
   $dealerId = (int)$pdo->lastInsertId();
   event_log("dealer_created", ["dealer_id"=>$dealerId], ["phone"=>$phone]);
+  if ($created){
+    queue_notification($phone, "Welcome to Pipii! Your dealer account on " . SITE_URL . " is ready; the login page is coming soon.", ["dealer_id"=>$dealerId, "type"=>"dealer_welcome"]);
+  }
 
   json_out(["ok"=>true, "dealer"=>["id"=>$dealerId,"full_name"=>$name,"phone_e164"=>$phone], "created"=>true]);
 }
@@ -571,6 +714,12 @@ if ($action === "yard_add") {
 
   $yardId = (int)$pdo->lastInsertId();
   event_log("yard_created", ["dealer_id"=>$dealerId], ["yard_id"=>$yardId, "yard_name"=>$yardName, "town_id"=>$townId]);
+  $phoneStmt = $pdo->prepare("SELECT phone_e164 FROM users WHERE id=? LIMIT 1");
+  $phoneStmt->execute([$dealerId]);
+  $dealerPhone = $phoneStmt->fetchColumn();
+  if ($dealerPhone){
+    queue_notification($dealerPhone, "New yard {$yardName} has been added to your Pipii account. Login at " . SITE_URL . " once the page is active.", ["yard_id"=>$yardId, "type"=>"yard_welcome"]);
+  }
   json_out(["ok"=>true, "id"=>$yardId, "yard_name"=>$yardName]);
 }
 
@@ -617,15 +766,13 @@ if ($action === "listing_create") {
     $featuresArr
   ), fn($s)=>$s!=="")));
 
-  $expiryDays = intv($_POST["expiry_days"] ?? 30, 1, 365) ?? 30;
-  $sponsorDays = intv($_POST["sponsor_days"] ?? 0, 0, 365) ?? 0;
+  $expiryDays = 30;
+  $sponsorDays = 0;
 
   // HP terms
   $hpOn = bool01($_POST["hp_on"] ?? 0) === 1;
-  $hpMinDeposit = intv($_POST["hp_min_deposit"] ?? null, 1, 2000000000);
-  $hpMaxDeposit = intv($_POST["hp_max_deposit"] ?? null, 1, 2000000000);
-  $hpMinMonths  = intv($_POST["hp_min_months"] ?? 3, 1, 120) ?? 3;
-  $hpMaxMonths  = intv($_POST["hp_max_months"] ?? 60, 1, 120) ?? 60;
+  $hpDeposit = intv($_POST["hp_deposit"] ?? null, 1, 2000000000);
+  $hpMonths  = intv($_POST["hp_months"] ?? 12, 1, 120) ?? 12;
   $hpNotes      = clean_str($_POST["hp_notes"] ?? "", 255);
 
   // Required per schema
@@ -636,9 +783,9 @@ if ($action === "listing_create") {
   if (!$engineCc) json_out(["ok"=>false,"error"=>"engine_cc required"], 422);
   if (!$priceKes) json_out(["ok"=>false,"error"=>"cash_price_kes required"], 422);
 
-  if ($hpOn && !$hpMinDeposit) json_out(["ok"=>false,"error"=>"HP enabled: min deposit required"], 422);
-  if ($hpMinMonths > $hpMaxMonths) json_out(["ok"=>false,"error"=>"HP months invalid"], 422);
-  if ($hpMaxDeposit !== null && $hpMaxDeposit < $hpMinDeposit) json_out(["ok"=>false,"error"=>"HP deposit range invalid"], 422);
+  if ($hpOn && (!$hpDeposit || !$hpMonths)) {
+    json_out(["ok"=>false,"error"=>"HP enabled: deposit and months required"], 422);
+  }
 
   // enums
   $fuelOk = in_array($fuel, ["petrol","diesel","hybrid","electric","other",""], true);
@@ -738,11 +885,11 @@ if ($action === "listing_create") {
       ");
       $hpIns->execute([
         $listingId,
-        $hpMinDeposit,
-        $hpMaxDeposit ?: null,
-        null,
-        $hpMinMonths,
-        $hpMaxMonths,
+        $hpDeposit,
+        $hpDeposit,
+        $hpDeposit,
+        $hpMonths,
+        $hpMonths,
         $hpNotes !== "" ? $hpNotes : null,
         now_utc()
       ]);
@@ -786,6 +933,37 @@ if ($action === "listing_create") {
       "is_sponsored"=>$isSponsored,
       "expiry_days"=>$expiryDays
     ]);
+
+    $townLabel = "Unknown location";
+    if ($townId > 0) {
+      $townStmt = $pdo->prepare("SELECT name FROM towns WHERE id=? LIMIT 1");
+      $townStmt->execute([$townId]);
+      $townName = $townStmt->fetchColumn();
+      if ($townName) $townLabel = $townName;
+    }
+    $nowDate = (new DateTime("now", new DateTimeZone("UTC")))->format("Y-m-d");
+    $todayStmt = $pdo->prepare("SELECT COUNT(*) FROM listings WHERE DATE(created_at)=?");
+    $todayStmt->execute([$nowDate]);
+    $todayCount = (int)$todayStmt->fetchColumn();
+    $totalListings = (int)$pdo->query("SELECT COUNT(*) FROM listings")->fetchColumn();
+    $totalAccounts = (int)$pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
+    $adminMessage = "New Listing added {$makeName} {$modelName} in {$townLabel}. Total listings today {$todayCount}, total system listings {$totalListings}, total accounts {$totalAccounts}.";
+    queue_notification(ADMIN_PHONE, $adminMessage, [
+      "listing_id"=>$listingId,
+      "dealer_id"=>$dealerId,
+      "town"=>$townLabel
+    ]);
+    $ownerStmt = $pdo->prepare("SELECT phone_e164 FROM users WHERE id=? LIMIT 1");
+    $ownerStmt->execute([$dealerId]);
+    $ownerPhone = $ownerStmt->fetchColumn();
+    if ($ownerPhone){
+      $ownerMessage = "Your listing for {$makeName} {$modelName} is live at " . SITE_URL . "/listing.php?id={$listingId}";
+      queue_notification($ownerPhone, $ownerMessage, [
+        "listing_id"=>$listingId,
+        "dealer_id"=>$dealerId,
+        "type"=>"listing_owner"
+      ]);
+    }
 
     $pdo->commit();
     json_out(["ok"=>true, "listing_id"=>$listingId]);
@@ -921,6 +1099,15 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     .btnSolid:hover{ background: rgba(255,255,255,.92); }
     .btnGhost{ background: transparent; border-color: rgba(255,255,255,.10); }
     .btnDanger{ background: rgba(244,63,94,.14); border-color: rgba(244,63,94,.30); color: rgba(255,220,230,.95); }
+    .btnGreen{
+      background: linear-gradient(140deg, #22c55e, #16a34a);
+      border-color: rgba(34,197,94,.45);
+      color: #03210b;
+    }
+    .btnGreen:hover{
+      background: linear-gradient(140deg, #2dd16b, #1a9d4f);
+      border-color: rgba(34,197,94,.65);
+    }
     .btnAdd{
       padding: 10px 14px;
       border-radius: 14px;
@@ -938,41 +1125,89 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     .btnAdd:hover{ border-color: rgba(255,255,255,.28); background: rgba(255,255,255,.05); }
 
     .selectedCard{
-      border-radius: 16px;
-      border: 1px solid rgba(255,255,255,.14);
-      background: rgba(255,255,255,.035);
-      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.18);
+      background: linear-gradient(135deg, rgba(59,130,246,.12), rgba(15,23,42,.55));
+      padding: 12px 16px;
       min-width: 220px;
-      color: rgba(255,255,255,.9);
-      box-shadow: 0 12px 28px rgba(0,0,0,.25);
+      color: rgba(255,255,255,.92);
+      box-shadow: 0 18px 36px rgba(0,0,0,.35);
       display:flex;
       flex-direction:column;
       gap: 4px;
+      position:relative;
+      overflow:hidden;
+    }
+    .selectedCard::after{
+      content:'';
+      position:absolute;
+      inset:0;
+      border-radius: inherit;
+      border: 1px solid rgba(255,255,255,.12);
+      pointer-events:none;
+    }
+    .selectedCard.empty{
+      border-style:dashed;
+      background: rgba(255,255,255,.03);
+      box-shadow:none;
+      color: rgba(255,255,255,.65);
     }
     .selectedCard .scLabel{
       font-size: 10px;
       letter-spacing: .18em;
       text-transform: uppercase;
-      color: rgba(255,255,255,.6);
+      color: rgba(255,255,255,.75);
     }
     .selectedCard .scValue{
-      font-size: 15px;
+      font-size: 16px;
       font-weight: 800;
     }
     .selectedCard .scSub{
       font-size: 12px;
-      color: rgba(255,255,255,.7);
+      color: rgba(255,255,255,.78);
     }
     .dealerAccent{
       display:inline-flex;
       align-items:center;
       gap: 6px;
-      padding: 2px 10px;
+      padding: 3px 12px;
       border-radius: 999px;
-      background: rgba(255,255,255,.12);
-      color: rgba(255,255,255,.95);
+      background: linear-gradient(135deg, rgba(59,130,246,.22), rgba(37,99,235,.4));
+      color: rgba(219,234,254,.95);
       font-weight: 800;
       letter-spacing: .01em;
+    }
+    .dealerInfoRow{
+      margin-bottom: 8px;
+      width:100%;
+    }
+    .dealerInfoCard{
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: linear-gradient(135deg, rgba(59,130,246,.15), rgba(15,23,42,.75));
+      padding: 16px 18px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      color: rgba(255,255,255,.95);
+      display:flex;
+      flex-direction:column;
+      gap: 4px;
+    }
+    .dealerInfoCard.empty{
+      background: rgba(255,255,255,.03);
+      border-color: rgba(255,255,255,.18);
+      color: rgba(255,255,255,.65);
+      box-shadow: none;
+    }
+    .dealerInfoCard .scSub2{
+      font-size: 12px;
+      opacity: .8;
+      color: rgba(255,255,255,.9);
+    }
+    .dealerInfoCard .scSub3{
+      font-size: 11px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.65);
     }
     .btnIconTail{
       display:inline-flex;
@@ -1084,9 +1319,44 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       gap: 12px;
     }
     .previewTitle{ font-size: 18px; font-weight: 800; color:#fff; }
-    .previewMeta{ font-size: 12px; color: rgba(255,255,255,.6); margin-top: 4px; }
-    .previewPrice{ font-size: 22px; font-weight: 800; color: #fff; }
-    .previewDealer{ font-size: 12px; color: rgba(255,255,255,.7); }
+    .previewMeta{
+      font-size: 12px;
+      color: rgba(255,255,255,.6);
+      margin-top: 4px;
+      display:flex;
+      align-items:center;
+      gap: 6px;
+    }
+    .previewPrice{
+      font-size: 22px;
+      font-weight: 800;
+      color: #facc15;
+      text-shadow: 0 8px 20px rgba(0,0,0,.35);
+    }
+    .previewDealer{
+      font-size: 12px;
+      color: rgba(255,255,255,.7);
+      display:flex;
+      align-items:center;
+      gap: 6px;
+    }
+    .previewMetaIcon,
+    .previewDealerIcon{
+      width: 18px;
+      height: 18px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.2);
+      background: rgba(255,255,255,.06);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .previewMetaIcon svg,
+    .previewDealerIcon svg{
+      width: 12px;
+      height: 12px;
+      stroke: rgba(255,255,255,.75);
+    }
     .placeholder{ color: rgba(255,255,255,.4)!important; }
     .previewSpecChips,
     .previewFeatureChips{
@@ -1094,15 +1364,26 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       flex-wrap:wrap;
       gap: 8px;
     }
+    .previewSectionTitle{
+      font-size: 11px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.5);
+    }
+    .previewDivider{
+      height:1px;
+      background: rgba(255,255,255,.08);
+      margin: 8px 0;
+    }
     .previewChip{
       display:inline-flex;
       align-items:center;
       gap: 4px;
-      padding: 4px 8px;
+      padding: 3px 7px;
       border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.1);
-      background: rgba(255,255,255,.04);
-      font-size: 11px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.02);
+      font-size: 10px;
       font-weight: 700;
       color: rgba(255,255,255,.92);
     }
@@ -1175,43 +1456,53 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
     .colorSwatchGrid{
       display:grid;
-      grid-template-columns: repeat(2, minmax(0,1fr));
+      grid-template-columns: repeat(3, minmax(0,1fr));
       gap: 10px;
     }
-    @media (min-width: 800px){
-      .colorSwatchGrid{ grid-template-columns: repeat(3, minmax(0,1fr)); }
-    }
-    .colorSwatch{
+    @media (max-width: 860px){ .colorSwatchGrid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 520px){ .colorSwatchGrid{ grid-template-columns: repeat(1, minmax(0,1fr)); } }
+    .colorChip{
       width:100%;
-      border-radius: 16px;
-      border: 1px solid rgba(255,255,255,.12);
-      background: rgba(255,255,255,.02);
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,.18);
+      background: rgba(15,23,42,.4);
       display:flex;
       align-items:center;
       gap: 10px;
-      padding: 10px 12px;
+      padding: 6px 12px;
       cursor:pointer;
-      transition: background .14s, border-color .14s, color .14s;
-      color: rgba(255,255,255,.85);
+      transition: background .14s, border-color .14s, transform .14s, color .14s;
+      min-height: 34px;
+      font-size: 12px;
+      font-weight: 700;
+      color: rgba(255,255,255,.9);
+      text-align:left;
     }
-    .colorSwatch::before{
-      content:'';
-      width: 22px; height: 22px;
+    .colorChip[aria-selected="true"]{
+      border-color: rgba(56,189,248,.8);
+      background: rgba(56,189,248,.18);
+      box-shadow: 0 10px 28px rgba(14,165,233,.35);
+      color: rgba(255,255,255,1);
+    }
+    .colorChip:focus-visible{
+      outline: 2px solid rgba(59,130,246,.8);
+      outline-offset: 3px;
+    }
+    .colorChipSwatch{
+      width: 18px;
+      height: 18px;
       border-radius: 999px;
-      background: var(--swatch-color,#fff);
-      border: 1px solid rgba(255,255,255,.25);
+      border: 1px solid rgba(255,255,255,.45);
       box-shadow: 0 6px 18px rgba(0,0,0,.25);
       flex: 0 0 auto;
+      background: var(--color-chip, #fff);
     }
-    .colorSwatch[aria-selected="true"]{
-      background: var(--swatch-color, rgba(255,255,255,.18));
-      border-color: rgba(255,255,255,.4);
-      color: var(--swatch-ink, #111);
-      box-shadow: 0 18px 45px rgba(0,0,0,.25);
+    .colorChipLabel{
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .colorSwatchMeta{ display:flex; flex-direction:column; align-items:flex-start; }
-    .colorName{ font-size: 13px; font-weight: 700; }
-    .colorHint{ font-size: 11px; opacity: .75; }
     .hpPlanSummary{
       border-radius: 14px;
       border: 1px solid rgba(255,255,255,.12);
@@ -1245,83 +1536,59 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       color: rgba(255,255,255,.7);
       line-height: 1.4;
     }
-    .calendarWidget{
-      margin-top: 14px;
-      border-radius: 16px;
-      border: 1px solid rgba(255,255,255,.08);
-      background: rgba(10,13,21,.65);
-      padding: 12px;
-    }
-    .calendarHeader{
+    .dupList{
+      margin-top: 12px;
       display:flex;
-      align-items:center;
-      justify-content:space-between;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: .05em;
-      text-transform: uppercase;
+      flex-direction:column;
+      gap: 8px;
     }
-    .calendarHeader button{
-      border: 1px solid rgba(255,255,255,.14);
-      background: rgba(255,255,255,.04);
-      color: rgba(255,255,255,.85);
-      border-radius: 10px;
-      width:32px;
-      height:32px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
+    .dupOption{
+      width:100%;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.03);
+      padding: 10px 12px;
+      text-align:left;
+      color: inherit;
       cursor:pointer;
       transition: background .14s, border-color .14s;
     }
-    .calendarHeader button:hover{
-      border-color: rgba(255,255,255,.25);
-      background: rgba(255,255,255,.08);
+    .dupOption:hover{
+      border-color: rgba(255,255,255,.3);
+      background: rgba(255,255,255,.05);
     }
-    .calendarDays{
-      display:grid;
-      grid-template-columns: repeat(7, minmax(0,1fr));
-      gap: 6px;
-      margin-top: 12px;
-      font-size: 10px;
+    .dupTitle{ font-weight: 700; }
+    .dupDetail{ font-size: 12px; opacity: .7; margin-top: 2px; }
+    .keyFigure{
+      color: #facc15;
+      font-weight: 800;
+    }
+    .callout{
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(15,23,42,.6);
+      padding: 16px;
+    }
+    .calloutTitle{
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .16em;
       text-transform: uppercase;
-      color: rgba(255,255,255,.6);
-      letter-spacing: .18em;
-      text-align:center;
+      color: rgba(255,255,255,.7);
     }
-    .calendarGrid{
-      display:grid;
-      grid-template-columns: repeat(7, minmax(0,1fr));
-      gap: 6px;
+    .calloutText{
       margin-top: 8px;
-    }
-    .calendarCell{
-      border-radius: 12px;
-      border: 1px solid rgba(255,255,255,.08);
-      min-height: 38px;
-      background: rgba(255,255,255,.03);
-      color: rgba(255,255,255,.82);
-      display:flex;
-      align-items:center;
-      justify-content:center;
       font-size: 13px;
-      cursor:pointer;
-      transition: background .14s, border-color .14s, transform .08s;
+      color: rgba(255,255,255,.86);
+      line-height: 1.45;
     }
-    .calendarCell[disabled]{
-      opacity: .2;
-      cursor: default;
+    .calloutAccent{
+      background: linear-gradient(135deg, rgba(59,130,246,.25), rgba(59,130,246,.5));
+      border-color: rgba(59,130,246,.35);
+      color: rgba(219,234,254,.95);
     }
-    .calendarCell[aria-selected="true"]{
-      background: rgba(59,130,246,.22);
-      border-color: rgba(59,130,246,.55);
-      color: #fff;
-      box-shadow: 0 10px 26px rgba(15,118,243,.28);
-    }
-    .calendarCell:not([disabled]):hover{
-      border-color: rgba(255,255,255,.22);
-      background: rgba(255,255,255,.08);
-    }
+    .calloutAccent .calloutTitle{ color: rgba(191,219,254,.9); }
+    .calloutAccent .calloutText{ color: rgba(240,249,255,.95); }
 
     .field{
       width:100%;
@@ -1340,6 +1607,10 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       box-shadow: 0 0 0 4px rgba(255,255,255,.06);
       background: rgba(255,255,255,.065);
     }
+    .field.autoFill{
+      color: rgba(191,219,254,.85);
+      font-style: italic;
+    }
     .label{ font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--mut2); }
     .hr{ height:1px; background: rgba(255,255,255,.07); }
 
@@ -1353,43 +1624,43 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       display:flex;
       align-items:center;
       gap: 6px;
-      padding: 7px 10px;
-      border-radius: 12px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.028);
-      --pill-selected-bg: rgba(255,255,255,.11);
+      padding: 6px 9px;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,.25);
+      background: rgba(15,23,42,.28);
+      --pill-selected-bg: rgba(59,130,246,.18);
       cursor:pointer;
       user-select:none;
-      min-height: 32px;
+      min-height: 30px;
       transition: transform .08s, border-color .14s, background .14s, filter .14s, box-shadow .18s;
       overflow:hidden;
     }
-    .pill:hover{ border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.05); }
+    .pill:hover{ border-color: rgba(255,255,255,.18); background: rgba(59,130,246,.12); }
     .pill:active{ transform: translateY(1px); }
     .pill[aria-selected="true"]{
-      border-color: rgba(0,0,0,.16);
+      border-color: transparent;
       background: var(--pill-selected-bg);
-      box-shadow: 0 12px 26px rgba(0,0,0,.32);
+      box-shadow: 0 12px 22px rgba(0,0,0,.28);
     }
     .pill .ic{
-      width: 22px; height: 22px;
-      border-radius: 9px;
+      width: 20px; height: 20px;
+      border-radius: 8px;
       display:flex; align-items:center; justify-content:center;
-      border: 1px solid rgba(255,255,255,.14);
+      border: 1px solid rgba(255,255,255,.18);
       background: var(--pill-accent, rgba(255,255,255,.08));
       color: rgba(7,12,22,.85);
       overflow:hidden;
       flex: 0 0 auto;
-      box-shadow: 0 8px 18px rgba(0,0,0,.25);
+      box-shadow: 0 6px 16px rgba(0,0,0,.25);
     }
     .pill .ic svg{
-      width: 11px;
-      height: 11px;
+      width: 9px;
+      height: 9px;
       stroke: currentColor;
     }
     .pill .tx{ min-width:0; }
     .pill .tx .t{
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 800;
       color: rgba(255,255,255,.9);
       white-space:nowrap;
@@ -1408,7 +1679,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       color: var(--pill-selected-sub, rgba(15,23,42,.6));
     }
     .pill[aria-selected="true"] .ic{
-      background: rgba(255,255,255,.18);
+      background: rgba(255,255,255,.25);
       color: var(--pill-selected-ink, #0f172a);
       border-color: rgba(0,0,0,.14);
       box-shadow: none;
@@ -1444,20 +1715,49 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
     .toast{
       position: fixed;
-      right: 16px;
-      bottom: 16px;
+      bottom: 22px;
+      left: 50%;
+      transform: translateX(-50%);
       z-index: 2000;
-      max-width: 380px;
+      width: min(360px, calc(100% - 32px));
       display:none;
-      border-radius: 18px;
+      border-radius: 20px;
       border: 1px solid rgba(255,255,255,.12);
-      background: rgba(10,12,18,.92);
-      backdrop-filter: blur(10px);
-      padding: 12px 14px;
-      box-shadow: 0 18px 70px rgba(0,0,0,.45);
+      background: rgba(15,23,42,.95);
+      padding: 10px 18px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.55);
+      backdrop-filter: blur(12px);
+      align-items:center;
+      gap: 14px;
+      color: #f8fafc;
     }
-    .toastTitle{ font-weight: 800; font-size: 13px; }
-    .toastSub{ font-size: 12px; color: rgba(255,255,255,.62); margin-top: 2px; }
+    .toastIcon{
+      width: 36px;
+      height: 36px;
+      border-radius: 14px;
+      background: rgba(255,255,255,.12);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      flex-shrink:0;
+    }
+    .toastIcon svg{
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 2.2;
+      fill: none;
+    }
+    .toastTitle{ font-weight: 900; font-size: 14px; }
+    .toastSub{ font-size: 12px; color: rgba(255,255,255,.72); margin-top: 2px; }
+    .toast--success{ border-color: rgba(34,197,94,.5); background: rgba(16,185,129,.18); color: #dcfce7; }
+    .toast--success .toastIcon{ background: rgba(16,185,129,.18); color: #4ade80; }
+    .toast--error{ border-color: rgba(248,113,113,.6); background: rgba(248,113,113,.15); color: #fee2e2; }
+    .toast--error .toastIcon{ background: rgba(248,113,113,.25); color: #f87171; }
+    .toast--warning{ border-color: rgba(249,115,22,.6); background: rgba(249,115,22,.15); color: #ffedd5; }
+    .toast--warning .toastIcon{ background: rgba(249,115,22,.2); color: #fb923c; }
+    .toast--info{ border-color: rgba(59,130,246,.5); background: rgba(59,130,246,.12); color: #dbeafe; }
+    .toast--info .toastIcon{ background: rgba(59,130,246,.25); color: #60a5fa; }
 
     /* Mobile bottom nav */
     .mobileNav{
@@ -1584,6 +1884,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             </div>
             <div class="previewDealer" id="previewDealer">Select dealer to start</div>
             <div class="previewSpecChips" id="previewSpecChips"></div>
+            <div class="previewDivider"></div>
+            <div class="previewSectionTitle">Features</div>
             <div class="previewFeatureChips" id="previewFeatureChips"></div>
             <div class="previewSale" id="previewSale"></div>
           </div>
@@ -1629,24 +1931,67 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     </div>
   </div>
 
-  <div class="toast" id="toast">
-    <div class="toastTitle" id="toastTitle">Saved</div>
-    <div class="toastSub" id="toastSub">Done</div>
+  <div class="toast toast--info" id="toast">
+    <div class="toastIcon" id="toastIcon">
+      <span class="toastIconSvg" aria-hidden="true"></span>
+    </div>
+    <div>
+      <div class="toastTitle" id="toastTitle">Saved</div>
+      <div class="toastSub" id="toastSub">Done</div>
+    </div>
   </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
     const API_BASE = window.location.pathname;
     const PUBLISH_CANCELLED = 'PUBLISH_CANCELLED';
+    const COMMON_MAKES = ["Toyota","Nissan","Subaru","Mazda","Mercedes-Benz","BMW","Volkswagen","Honda","Isuzu","Mitsubishi","Ford","Hyundai","Kia","Audi"];
+    const COMMON_MODEL_MAP = {
+      "toyota": ["Vitz","Corolla","Axio","Harrier","Prado","Fortuner","Belta","Allion","Wish","Hiace","Land Cruiser"],
+      "nissan": ["Note","March","X-Trail","Navara","Juke","Dualis"],
+      "mazda": ["Demio","CX-5","Axela","Atenza"],
+      "honda": ["Fit","Vezel","CR-V","Grace"],
+      "subaru": ["Forester","Impreza","Outback","XV"],
+      "volkswagen": ["Golf","Tiguan","Polo","Passat"],
+      "mercedes-benz": ["C-Class","E-Class","GLA","GLC"],
+      "bmw": ["3 Series","5 Series","X3","X5"]
+    };
+    const COMMON_TOWNS = ["Mombasa","Nairobi","Kiambu","Thika","Eldoret","Kisumu","Nakuru"];
+    const COMMON_FEATURES = ["airbags","abs","alarm","bluetooth","backup_camera","parking_sensors","touchscreen","daytime_running_lights","fog_lights","sunroof","immobilizer","android_auto","apple_carplay"];
     const ICON_ARROW_RIGHT = '<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
     const ICON_ARROW_LEFT = '<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
 
     /* ---------- Toast ---------- */
-    function toast(title, sub){
+    function toast(title, sub, type){
       const t = $('toast');
+      if (!t) return;
+      const allowed = ['success','error','warning','info'];
+      let status = allowed.includes(type) ? type : null;
+      if (!status){
+        const norm = (title || '').toLowerCase();
+        if (/skip|incomplete|disabled|pending|cancelled/.test(norm)) status = 'warning';
+        else if (norm.includes('cannot list') || /error|missing|required|invalid|failed|unable|issue|unknown|cannot/.test(norm)) status = 'error';
+        else if (/saved|created|cleared|selected|success|done|published|added|updated|complete|uploaded|loaded/.test(norm)) status = 'success';
+        else status = 'info';
+      }
+      allowed.forEach(cls=> t.classList.remove(`toast--${cls}`));
+      t.classList.add(`toast--${status}`);
+
+      const iconMap = {
+        success: 'money',
+        error: 'alert',
+        warning: 'shield',
+        info: 'tag'
+      };
+      const iconKind = iconMap[status] || 'tag';
+      const iconSlot = $('toastIconSvg');
+      if (iconSlot){
+        iconSlot.innerHTML = duotoneIcon(iconKind);
+      }
+
       $('toastTitle').textContent = title;
       $('toastSub').textContent = sub || '';
-      t.style.display = 'block';
+      t.style.display = 'flex';
       clearTimeout(window.__toastT);
       window.__toastT = setTimeout(()=> t.style.display='none', 2600);
     }
@@ -1747,7 +2092,18 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (state.make && state.make.name) parts.push(state.make.name);
       if (state.model && state.model.name) parts.push(state.model.name);
       if (state.body) parts.push(state.body);
-      return parts.length ? parts.join(' ') : 'Add a vehicle';
+      if (!parts.length) return 'Add a vehicle';
+      const base = parts.join(' ');
+      const suffixes = [];
+      if (state.town && state.town.name){
+        suffixes.push(`in ${state.town.name}`);
+      }
+      const detailPieces = [];
+      if (state.fuel) detailPieces.push(niceLabel(state.fuel));
+      if (state.engine) detailPieces.push(`${Number(state.engine).toLocaleString()}cc`);
+      if (detailPieces.length) suffixes.push(detailPieces.join(' • '));
+      if (!suffixes.length) return base;
+      return `${base} ${suffixes.join(' - ')}`;
     }
     function setPreviewText(elId, value, placeholder){
       const el = $(elId);
@@ -1801,6 +2157,21 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <path ${common} d="M4 7h4l2-2h4l2 2h4v12H4z"/>
             <path ${common} opacity=".55" d="M12 10a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/>
           </svg>`;
+        case 'building': return `
+          <svg ${sizeAttr}>
+            <path ${common} d="M5 21V5l7-2 7 2v16"/>
+            <path ${common} opacity=".55" d="M9 10h2M13 10h2M9 14h2M13 14h2M9 18h2M13 18h2"/>
+          </svg>`;
+        case 'shield': return `
+          <svg ${sizeAttr}>
+            <path ${common} d="M12 21s7-3 7-9V4l-7-3-7 3v8c0 6 7 9 7 9z"/>
+            <path ${common} opacity=".55" d="M12 9v5M12 16h.01"/>
+          </svg>`;
+        case 'alert': return `
+          <svg ${sizeAttr}>
+            <path ${common} d="M12 4 4 20h16L12 4z"/>
+            <path ${common} opacity=".55" d="M12 9v4M12 16h.01"/>
+          </svg>`;
         case 'car':
         default: return `
           <svg ${sizeAttr}>
@@ -1813,7 +2184,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     function pillEl({id, title, sub, kind, key, selected=false}){
       const bg = pastelFromKey(key || title || id);
       const ink = isLightColor(bg) ? '#0f172a' : '#f8fafc';
-      const sub = isLightColor(bg) ? 'rgba(15,23,42,.62)' : 'rgba(255,255,255,.75)';
+      const subInk = isLightColor(bg) ? 'rgba(15,23,42,.62)' : 'rgba(255,255,255,.75)';
       const el = document.createElement('div');
       el.className = 'pill';
       el.setAttribute('role','button');
@@ -1825,16 +2196,17 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       el.dataset.pastel = '1';
       el.style.setProperty('--pill-selected-bg', bg);
       el.style.setProperty('--pill-selected-ink', ink);
-      el.style.setProperty('--pill-selected-sub', sub);
+      el.style.setProperty('--pill-selected-sub', subInk);
       el.style.setProperty('--pill-accent', bg);
 
+      const subHtml = sub ? `<div class="s">${escapeHtml(sub)}</div>` : '';
       el.innerHTML = `
         <div class="ic">
           <div style="opacity:.92">${duotoneIcon(kind || 'car')}</div>
         </div>
         <div class="tx">
           <div class="t">${escapeHtml(title || '')}</div>
-          ${sub ? `<div class="s">${escapeHtml(sub)}</div>` : `<div class="s">Tap to select</div>`}
+          ${subHtml}
         </div>
       `;
       return el;
@@ -1844,6 +2216,127 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       return String(str).replace(/[&<>"']/g, (m)=>({
         '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
       }[m]));
+    }
+    function normalizeEntityName(str){
+      return String(str || '').trim().toLowerCase().replace(/[\s\-_]+/g,' ');
+    }
+    function levenshteinDistance(a,b){
+      const s = a.split(''), t = b.split('');
+      const rows = s.length + 1;
+      const cols = t.length + 1;
+      const dist = Array.from({length: rows}, ()=> Array(cols).fill(0));
+      for (let i=0;i<rows;i++) dist[i][0] = i;
+      for (let j=0;j<cols;j++) dist[0][j] = j;
+      for (let i=1;i<rows;i++){
+        for (let j=1;j<cols;j++){
+          const cost = s[i-1] === t[j-1] ? 0 : 1;
+          dist[i][j] = Math.min(
+            dist[i-1][j] + 1,
+            dist[i][j-1] + 1,
+            dist[i-1][j-1] + cost
+          );
+        }
+      }
+      return dist[rows-1][cols-1];
+    }
+    function valuesAreSimilar(a,b){
+      if (!a || !b) return false;
+      if (a === b) return true;
+      if (a.includes(b) || b.includes(a)) return true;
+      return levenshteinDistance(a,b) <= 1;
+    }
+    function findSimilarEntries(value, items, getLabel, getDetail){
+      const normValue = normalizeEntityName(value);
+      if (!normValue) return [];
+      const out = [];
+      (items || []).forEach(item=>{
+        const label = getLabel ? getLabel(item) : item;
+        const normLabel = normalizeEntityName(label);
+        if (!normLabel) return;
+        if (valuesAreSimilar(normValue, normLabel)){
+          out.push({
+            item,
+            label,
+            detail: getDetail ? getDetail(item) : ''
+          });
+        }
+      });
+      return out;
+    }
+    function showSimilarityModal({typeLabel, value, matches, onUseExisting, onOverride, onEdit}){
+      const listHtml = matches.map((match, idx)=>`
+        <button class="dupOption" type="button" data-sim-index="${idx}">
+          <div class="dupTitle">${escapeHtml(match.label || '')}</div>
+          ${match.detail ? `<div class="dupDetail">${escapeHtml(match.detail)}</div>` : ''}
+        </button>
+      `).join('');
+      openModal(`Similar ${typeLabel} found`, `We found similar entries to “${escapeHtml(value)}”.`, `
+        <div class="dupList">
+          ${listHtml || '<div class="qSub">No similar entries.</div>'}
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button class="btn btnGreen" type="button" id="dupSaveAnyway">Save anyway${ICON_ARROW_RIGHT}</button>
+          <button class="btn btnGhost" type="button" id="dupEditEntry">Edit entry</button>
+        </div>
+      `);
+      const body = $('modalBody');
+      body?.querySelectorAll('.dupOption').forEach(btn=>{
+        btn.addEventListener('click', ()=>{
+          const idx = Number(btn.getAttribute('data-sim-index'));
+          if (Number.isNaN(idx)) return;
+          const match = matches[idx];
+          closeModal();
+          onUseExisting && onUseExisting(match.item);
+        });
+      });
+      $('dupSaveAnyway')?.addEventListener('click', ()=>{
+        closeModal();
+        onOverride && onOverride();
+      });
+      $('dupEditEntry')?.addEventListener('click', ()=>{
+        closeModal();
+        onEdit && onEdit();
+      });
+    }
+
+    function partitionByPriority(items, priorityList, keyFn){
+      const prioritySet = new Set((priorityList || []).map(normalizeEntityName));
+      const common = [];
+      const rest = [];
+      (items || []).forEach(item=>{
+        const key = normalizeEntityName(keyFn ? keyFn(item) : item);
+        if (prioritySet.has(key)) common.push(item);
+        else rest.push(item);
+      });
+      return {common, rest};
+    }
+    function orderByPriorityList(items, priorityList, keyFn){
+      if (!Array.isArray(items)) return [];
+      const map = new Map();
+      (priorityList || []).forEach((val, idx)=> map.set(normalizeEntityName(val), idx));
+      return items.slice().sort((a,b)=>{
+        const aKey = normalizeEntityName(keyFn ? keyFn(a) : a);
+        const bKey = normalizeEntityName(keyFn ? keyFn(b) : b);
+        const aIdx = map.has(aKey) ? map.get(aKey) : priorityList.length + aKey.localeCompare(bKey);
+        const bIdx = map.has(bKey) ? map.get(bKey) : priorityList.length + bKey.localeCompare(aKey);
+        if (aIdx === bIdx){
+          return (keyFn ? keyFn(a) : a || '').localeCompare(keyFn ? keyFn(b) : b || '');
+        }
+        return aIdx - bIdx;
+      });
+    }
+    function orderFeaturesList(features){
+      if (!Array.isArray(features)) return [];
+      const priorityMap = new Map();
+      COMMON_FEATURES.forEach((tag, idx)=> priorityMap.set(normalizeEntityName(tag), idx));
+      return features.slice().sort((a,b)=>{
+        const aKey = normalizeEntityName(a.tag || a.label || '');
+        const bKey = normalizeEntityName(b.tag || b.label || '');
+        const aIdx = priorityMap.has(aKey) ? priorityMap.get(aKey) : COMMON_FEATURES.length + aKey.localeCompare(bKey);
+        const bIdx = priorityMap.has(bKey) ? priorityMap.get(bKey) : COMMON_FEATURES.length + bKey.localeCompare(aKey);
+        if (aIdx === bIdx) return (a.label || a.tag || '').localeCompare(b.label || b.tag || '');
+        return aIdx - bIdx;
+      });
     }
 
     /* ---------- Modal ---------- */
@@ -1861,24 +2354,27 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       return new Promise((resolve, reject)=>{
         const name = dealerName || 'this dealer';
         openModal("Confirm dealer", "Just a quick check before publishing.", `
-          <div class="selectedCard" style="margin-bottom:12px;">
-            <div class="scLabel">Dealer</div>
-            <div class="scValue">${escapeHtml(name)}</div>
-            <div class="scSub">Confirm this is the intended account.</div>
-          </div>
-          <div class="mt-4 flex flex-wrap gap-2">
-            <button class="btn btnGhost" type="button" id="confirmDealerNo">Go back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
-            <button class="btn btnSolid" type="button" id="confirmDealerYes">Publish for ${escapeHtml(name)}${ICON_ARROW_RIGHT}</button>
-          </div>
-        `);
+        <div class="selectedCard" style="margin-bottom:12px;">
+          <div class="scLabel">Dealer</div>
+          <div class="scValue">${escapeHtml(name)}</div>
+          <div class="scSub">Confirm this is the intended account.</div>
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button class="btn btnGhost" type="button" id="confirmDealerAnother">Select another dealer</button>
+          <button class="btn btnGhost" type="button" id="confirmDealerNo">Go back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+          <button class="btn btnSolid" type="button" id="confirmDealerYes">Publish for ${escapeHtml(name)}${ICON_ARROW_RIGHT}</button>
+        </div>
+      `);
 
         const yesBtn = $('confirmDealerYes');
+        const anotherBtn = $('confirmDealerAnother');
         const noBtn = $('confirmDealerNo');
         const overlay = $('modal');
         const closeBtn = $('modalClose');
 
         const cleanup = ()=>{
           yesBtn && yesBtn.removeEventListener('click', onYes);
+          anotherBtn && anotherBtn.removeEventListener('click', onAnother);
           noBtn && noBtn.removeEventListener('click', onCancel);
           overlay.removeEventListener('click', overlayHandler);
           closeBtn.removeEventListener('click', closeHandler);
@@ -1894,6 +2390,17 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           closeModal();
           reject(new Error(PUBLISH_CANCELLED));
         };
+        const onAnother = ()=>{
+          cleanup();
+          closeModal();
+          state.dealer = null;
+          state.yard = null;
+          state.dealerLocked = false;
+          updateSummary();
+          stepIndex = steps.indexOf("dealer");
+          fadeTo(()=>renderCurrent());
+          reject(new Error(PUBLISH_CANCELLED));
+        };
         const overlayHandler = (e)=>{
           if (e.target === overlay){
             cleanup();
@@ -1906,9 +2413,26 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         };
 
         yesBtn && yesBtn.addEventListener('click', onYes);
+        anotherBtn && anotherBtn.addEventListener('click', onAnother);
         noBtn && noBtn.addEventListener('click', onCancel);
         overlay.addEventListener('click', overlayHandler);
         closeBtn.addEventListener('click', closeHandler);
+      });
+    }
+
+    function showPublishSuccessModal(listingId, dealerName){
+      openModal("Listing published", "Great work! Listing is ready for review.", `
+        <div class="callout calloutAccent">
+          <div class="calloutTitle">Success</div>
+          <div class="calloutText">Listing #${listingId} for <strong>${escapeHtml(dealerName || 'the dealer')}</strong> is now in the system.</div>
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button class="btn btnGreen" type="button" id="btnPublishAnother">Publish another${ICON_ARROW_RIGHT}</button>
+        </div>
+      `);
+      $('btnPublishAnother')?.addEventListener('click', ()=>{
+        closeModal();
+        toast("Ready", "Start the next listing.");
       });
     }
 
@@ -1930,15 +2454,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       const financed = Math.max((state.price || 0) - deposit, 0);
       const safeMonths = Math.max(months, 1);
       const monthly = safeMonths ? financed / safeMonths : financed;
-      const today = new Date();
-      const defaultDate = today.toISOString().split('T')[0];
+      const anchorDate = new Date();
       const dealerName = state.dealer ? state.dealer.full_name : '—';
       const yardName = state.yard ? state.yard.yard_name : '—';
-      openModal("Hire purchase plan", "Select a start date to preview the amortization summary.", `
+      openModal("Hire purchase plan", "Quick planning schedule (assumes you start today).", `
         <div>
-          <div class="label">Start date</div>
-          <input class="field mt-2" type="date" id="hpPlanStart" value="${defaultDate}">
-          <div class="calendarWidget" id="hpCalendar"></div>
           <div class="hpPlanSummary mt-4" id="hpPlanSummary"></div>
           <div class="hpPlanSummary mt-3">Dealer: <strong>${escapeHtml(dealerName)}</strong><br>Yard: <strong>${escapeHtml(yardName || '—')}</strong></div>
           <table class="hpPlanTable">
@@ -1951,15 +2471,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           <div class="hpPlanNote">Planning figure only. Price may vary slightly due to extras like trackers (est. KES 4k–20k) and insurance (per policy).</div>
         </div>
       `);
-      const startInput = $('hpPlanStart');
       const summary = $('hpPlanSummary');
       const table = $('hpPlanTable');
-      const calendarEl = $('hpCalendar');
-      const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-      const dayNames = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-      let calendarCursor = startInput.value ? new Date(startInput.value) : new Date();
-      if (Number.isNaN(calendarCursor.getTime())) calendarCursor = new Date();
-      calendarCursor.setDate(1);
 
       const addMonths = (date, monthsToAdd)=>{
         const d = new Date(date.getTime());
@@ -1968,13 +2481,12 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       };
 
       const renderPlan = ()=>{
-        let start = startInput.value ? new Date(startInput.value) : new Date();
-        if (Number.isNaN(start.getTime())) start = new Date();
+        const start = new Date(anchorDate.getTime());
         const endDate = addMonths(start, safeMonths);
         summary.innerHTML = `
-          Pay a deposit of <strong>${formatKesSafe(deposit, 'KES 0')}</strong>, finance <strong>${formatKesSafe(financed, 'KES 0')}</strong>
-          over <strong>${safeMonths} month${safeMonths === 1 ? '' : 's'}</strong> at roughly <strong>${formatKesSafe(Math.round(monthly), 'KES 0')}</strong> per month.
-          Estimated completion: <strong>${endDate.toLocaleDateString()}</strong>.
+          Starting <span class="keyFigure">${start.toLocaleDateString()}</span>, pay a deposit of <span class="keyFigure">${formatKesSafe(deposit, 'KES 0')}</span>, finance <span class="keyFigure">${formatKesSafe(financed, 'KES 0')}</span>
+          over <span class="keyFigure">${safeMonths} month${safeMonths === 1 ? '' : 's'}</span> at roughly <span class="keyFigure">${formatKesSafe(Math.round(monthly), 'KES 0')}</span> per month.
+          Estimated completion: <span class="keyFigure">${endDate.toLocaleDateString()}</span>.
         `;
         const rows = [];
         rows.push(`
@@ -2008,77 +2520,13 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         table.innerHTML = rows.join('');
       };
 
-      const renderCalendar = ()=>{
-        if (!calendarEl) return;
-        const view = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth(), 1);
-        const selectedRaw = startInput.value ? new Date(startInput.value) : null;
-        calendarEl.innerHTML = `
-          <div class="calendarHeader">
-            <button type="button" id="calPrev">&lsaquo;</button>
-            <div>${monthNames[view.getMonth()]} ${view.getFullYear()}</div>
-            <button type="button" id="calNext">&rsaquo;</button>
-          </div>
-          <div class="calendarDays">${dayNames.map(d=>`<span>${d}</span>`).join('')}</div>
-          <div class="calendarGrid"></div>
-        `;
-        const grid = calendarEl.querySelector('.calendarGrid');
-        if (!grid) return;
-        const firstDay = (view.getDay() + 6) % 7; // Monday-first
-        for (let i=0; i<firstDay; i++){
-          const pad = document.createElement('div');
-          pad.className = 'calendarCell';
-          pad.setAttribute('disabled','true');
-          grid.appendChild(pad);
-        }
-        const daysInMonth = new Date(view.getFullYear(), view.getMonth()+1, 0).getDate();
-        for (let d=1; d<=daysInMonth; d++){
-          const btn = document.createElement('button');
-          btn.type = 'button';
-          btn.className = 'calendarCell';
-          btn.textContent = String(d);
-          const cellDate = new Date(view.getFullYear(), view.getMonth(), d);
-          const selected = selectedRaw && !Number.isNaN(selectedRaw.getTime()) &&
-            selectedRaw.getFullYear() === cellDate.getFullYear() &&
-            selectedRaw.getMonth() === cellDate.getMonth() &&
-            selectedRaw.getDate() === cellDate.getDate();
-          btn.setAttribute('aria-selected', selected ? 'true' : 'false');
-          btn.addEventListener('click', ()=>{
-            startInput.value = cellDate.toISOString().split('T')[0];
-            renderPlan();
-            calendarCursor = new Date(cellDate.getFullYear(), cellDate.getMonth(), 1);
-            renderCalendar();
-          });
-          grid.appendChild(btn);
-        }
-        $('calPrev')?.addEventListener('click', ()=>{
-          calendarCursor.setMonth(calendarCursor.getMonth() - 1);
-          renderCalendar();
-        });
-        $('calNext')?.addEventListener('click', ()=>{
-          calendarCursor.setMonth(calendarCursor.getMonth() + 1);
-          renderCalendar();
-        });
-      };
-
-      const handleStartChange = ()=>{
-        renderPlan();
-        if (startInput.value){
-          const cur = new Date(startInput.value);
-          if (!Number.isNaN(cur.getTime())){
-            calendarCursor = new Date(cur.getFullYear(), cur.getMonth(), 1);
-          }
-        }
-        renderCalendar();
-      };
-
-      startInput.addEventListener('change', handleStartChange);
       renderPlan();
-      renderCalendar();
     }
 
     /* ---------- Wizard State ---------- */
     const state = {
       dealer: null, // {id, full_name, phone_e164}
+      dealerLocked: false,
       yard: null,   // {id, yard_name}
       towns: [],
       makes: [],
@@ -2101,7 +2549,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       trans: null,
       color: null,
 
-      condition: "used",
+      condition: null,
 
       sale: {
         cash: true,
@@ -2122,9 +2570,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       title: '',
       trim: '',
-      description: ''
+      description: '',
+      priceStats: null
     };
     let previewSlideIndex = 0;
+    let isPublishing = false;
 
     const steps = [
       "dealer",
@@ -2154,6 +2604,20 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       $('stepChip').textContent = `Step ${cur}/${total}`;
       const pct = Math.round((stepIndex / (total-1)) * 100);
       $('barFill').style.width = pct + '%';
+      updateNavButtons();
+    }
+
+    function updateNavButtons(){
+      const isReview = steps[stepIndex] === 'review';
+      const label = isReview ? 'List now' : 'Next';
+      const html = `${label}${ICON_ARROW_RIGHT}`;
+      ['btnNext','btnNextTop','mNext'].forEach(id=>{
+        const btn = $(id);
+        if (!btn) return;
+        btn.innerHTML = html;
+        if (isReview) btn.classList.add('btnGreen');
+        else btn.classList.remove('btnGreen');
+      });
     }
 
     function fadeTo(renderFn){
@@ -2179,16 +2643,31 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (!card) return;
       const title = autoTitle();
       setPreviewText('previewTitle', title !== 'Add a vehicle' ? title : '', 'Add a vehicle');
-      const metaParts = [];
-      if (state.year) metaParts.push(state.year);
-      if (state.body) metaParts.push(state.body);
-      if (state.town) metaParts.push(state.town.name);
-      setPreviewText('previewMeta', metaParts.join(' • '), 'Year • Body • Town');
-      setPreviewText('previewPrice', state.price ? formatKesSafe(state.price) : '', 'Price pending');
-      const dealerLine = state.dealer
-        ? `${state.dealer.full_name}${state.yard ? ' • ' + state.yard.yard_name : ''}`
-        : '';
-      setPreviewText('previewDealer', dealerLine, 'Select dealer to start');
+      const metaEl = $('previewMeta');
+      if (metaEl){
+        const locationText = state.town ? state.town.name : '';
+        const placeholderText = 'Pick a town';
+        metaEl.innerHTML = `
+          <span class="previewMetaIcon">${duotoneIcon('pin')}</span>
+          <span>${escapeHtml(locationText || placeholderText)}</span>
+        `;
+        if (!locationText) metaEl.classList.add('placeholder'); else metaEl.classList.remove('placeholder');
+      }
+      const priceEl = $('previewPrice');
+      if (priceEl){
+        priceEl.textContent = state.price ? formatKesSafe(state.price) : 'KES 0';
+      }
+      const dealerEl = $('previewDealer');
+      if (dealerEl){
+        const dealerLine = state.dealer
+          ? `${state.dealer.full_name}${state.yard ? ' • ' + state.yard.yard_name : ''}`
+          : '';
+        dealerEl.innerHTML = `
+          <span class="previewDealerIcon">${duotoneIcon('building')}</span>
+          <span>${escapeHtml(dealerLine || 'Select dealer to start')}</span>
+        `;
+        if (!dealerLine) dealerEl.classList.add('placeholder'); else dealerEl.classList.remove('placeholder');
+      }
       updatePreviewMedia();
       renderSpecChips();
       renderFeatureChips();
@@ -2255,6 +2734,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (state.engine) chips.push({label:'Engine', value:`${state.engine}cc`, icon:'gear'});
       const mileageVal = formatNumberUnit(state.mileage, 'km');
       if (mileageVal) chips.push({label:'Mileage', value:mileageVal, icon:'bolt'});
+      if (state.body) chips.push({label:'Body', value:state.body, icon:'car'});
       if (state.fuel) chips.push({label:'Fuel', value:niceLabel(state.fuel), icon:'fuel'});
       if (state.trans) chips.push({label:'Trans', value:niceLabel(state.trans), icon:'trans'});
       if (state.color){
@@ -2383,6 +2863,73 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       }
     }
 
+    async function loadPriceStats(){
+      const box = $('priceStatsBox');
+      if (!box){
+        state.priceStats = null;
+        return;
+      }
+      if (!state.model){
+        state.priceStats = null;
+        updatePriceStatsUI();
+        return;
+      }
+      box.style.display = '';
+      const textEl = box.querySelector('.calloutText');
+      if (textEl) textEl.textContent = 'Looking up similar listings…';
+      try{
+        const params = {
+          a: 'price_stats',
+          vehicle_model_id: state.model.id
+        };
+        if (state.year) params.year = state.year;
+        const data = await apiGet(params);
+        state.priceStats = data.stats || null;
+      }catch(e){
+        state.priceStats = null;
+        if (textEl) textEl.textContent = e.message || 'Unable to load selling range.';
+        return;
+      }
+      updatePriceStatsUI();
+    }
+    function updatePriceStatsUI(){
+      const box = $('priceStatsBox');
+      if (!box) return;
+      if (!state.model){
+        box.style.display = 'none';
+        return;
+      }
+      box.style.display = '';
+      const textEl = box.querySelector('.calloutText');
+      if (!textEl) return;
+      if (!state.priceStats){
+        textEl.textContent = 'Looking up similar listings…';
+        return;
+      }
+      const stats = state.priceStats || {};
+      const count = Number(stats.count || 0);
+      const min = stats.min !== null && stats.min !== undefined ? Number(stats.min) : null;
+      const max = stats.max !== null && stats.max !== undefined ? Number(stats.max) : null;
+      const avg = stats.avg !== null && stats.avg !== undefined ? Number(stats.avg) : null;
+      if (!count){
+        textEl.innerHTML = 'No similar listings yet. Lead the market with your price.';
+        return;
+      }
+      const rows = [];
+      if (min && max){
+        rows.push(`Range: <strong>${formatKesSafe(min)}</strong> – <strong>${formatKesSafe(max)}</strong>`);
+      } else if (min){
+        rows.push(`Starting around <strong>${formatKesSafe(min)}</strong>`);
+      }
+      if (avg){
+        rows.push(`Average ask <strong>${formatKesSafe(avg)}</strong>`);
+      }
+      textEl.innerHTML = `
+        ${rows.join('<br>')}
+        <div class="mt-2 text-[11px] uppercase tracking-[.26em] text-white/60">${count} listing${count === 1 ? '' : 's'} sampled</div>
+      `;
+    }
+
     function hpMonthlyAmount(){
       if (!state.sale.hp) return null;
       if (!state.price || !state.hp.months) return null;
@@ -2392,11 +2939,12 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       return Math.round(financed / state.hp.months);
     }
     function hpSummaryText(){
-      const deposit = state.hp.deposit ? formatKesSafe(state.hp.deposit) : 'Deposit TBD';
+      const depositRaw = state.hp.deposit ? formatKesSafe(state.hp.deposit) : 'Deposit TBD';
+      const deposit = state.hp.deposit ? `<span class="keyFigure">${depositRaw}</span>` : depositRaw;
       const months = state.hp.months || 0;
       const tenor = months ? `${months} month${months === 1 ? '' : 's'}` : 'Tenor TBD';
       const monthly = hpMonthlyAmount();
-      const monthlyText = monthly ? ` • ${formatKesSafe(monthly)}/mo` : '';
+      const monthlyText = monthly ? ` • <span class="keyFigure">${formatKesSafe(monthly)}</span>/mo` : '';
       return `${deposit} • ${tenor}${monthlyText}`;
     }
 
@@ -2409,7 +2957,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       ]);
       state.towns = towns.towns || [];
       state.makes = makes.makes || [];
-      state.features = opt.features || [];
+      state.features = orderFeaturesList(opt.features || []);
     }
 
     async function loadModels(makeId){
@@ -2447,55 +2995,111 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       setQuestion("Who is the dealer?", "Enter phone once. We will load or create the dealer account.");
       const box = document.createElement('div');
       box.innerHTML = `
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="dealerInfoRow">
+          <div class="dealerInfoCard empty" id="dealerInfoCard">
+            <div class="scLabel">Dealer</div>
+            <div class="scValue">Lookup to reveal the dealer</div>
+            <div class="scSub">Enter phone and dealer name to load or create.</div>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
           <div>
             <div class="label">Dealer phone (07 / 01 / +254)</div>
             <input class="field mt-2" id="dealerPhone" placeholder="0712 000 000 or +254 712..." autocomplete="off">
           </div>
           <div>
             <div class="label">Dealer Name</div>
-            <input class="field mt-2" id="dealerName" placeholder="Optional" autocomplete="off">
+            <input class="field mt-2" id="dealerName" placeholder="e.g. Uptown Autos" autocomplete="off">
           </div>
         </div>
-        <div class="mt-4 flex flex-wrap items-start justify-between gap-3">
-          <div class="selectedCard" id="dealerCard" style="${state.dealer ? '' : 'display:none;'}"></div>
-          <div class="flex flex-wrap items-center justify-end gap-3" style="flex:1; min-width:220px;">
-            <div class="qSub">Status: <span class="text-white/85 font-extrabold" id="dealerStatus">${state.dealer ? escapeHtml(state.dealer.full_name) : 'Not selected'}</span></div>
-          <button class="btn btnSolid" type="button" id="btnDealerLookup">Lookup / Create<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3 10a7 7 0 1 1 2 5l-2 3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+        <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+          <div class="qSub">Status: <span class="text-white/85 font-extrabold" id="dealerStatus">${state.dealer ? escapeHtml(state.dealer.full_name) : 'Not selected'}</span></div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="btn btnGhost" type="button" id="btnDealerUnlock">Unlock</button>
+            <button class="btn btnSolid" type="button" id="btnDealerLookup">Lookup / Create<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3 10a7 7 0 1 1 2 5l-2 3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
           </div>
         </div>
       `;
       setBodyNode(box);
 
       $('dealerPhone').value = state.dealer ? (state.dealer.phone_e164 || '') : '';
+      $('dealerName').value = state.dealer ? (state.dealer.full_name || '') : '';
 
       const renderDealerCard = ()=>{
-        const card = $('dealerCard');
+        const card = $('dealerInfoCard');
         if (!card) return;
         if (!state.dealer){
-          card.style.display = 'none';
-          card.innerHTML = '';
-          return;
+          card.classList.add('empty');
+          card.innerHTML = `
+            <div class="scLabel">Dealer</div>
+            <div class="scValue">Lookup to reveal the dealer</div>
+            <div class="scSub">Enter phone and dealer name to load or create.</div>
+          `;
+        } else {
+          card.classList.remove('empty');
+          const yardLine = state.yard ? `<div class="scSub2">Yard: ${escapeHtml(state.yard.yard_name)}</div>` : '';
+          const lockNote = state.dealerLocked
+            ? '<div class="scSub3">Locked — unlock to change</div>'
+            : '<div class="scSub3">Unlocked — edit and lookup</div>';
+          card.innerHTML = `
+            <div class="scLabel">Dealer</div>
+            <div class="scValue">${escapeHtml(state.dealer.full_name)}</div>
+            <div class="scSub">${escapeHtml(state.dealer.phone_e164 || '')}</div>
+            ${yardLine}
+            ${lockNote}
+          `;
         }
-        card.style.display = 'flex';
-        card.innerHTML = `
-          <div class="scLabel">Dealer</div>
-          <div class="scValue">${escapeHtml(state.dealer.full_name)}</div>
-          <div class="scSub">${escapeHtml(state.dealer.phone_e164 || '')}</div>
-        `;
       };
       renderDealerCard();
 
+      const phoneInput = $('dealerPhone');
+      const nameInput = $('dealerName');
+      const lookupBtn = $('btnDealerLookup');
+      const unlockBtn = $('btnDealerUnlock');
+      const applyDealerLock = (locked)=>{
+        state.dealerLocked = locked;
+        if (phoneInput) phoneInput.disabled = locked;
+        if (nameInput) nameInput.disabled = locked;
+        if (unlockBtn){
+          unlockBtn.disabled = !locked;
+          unlockBtn.textContent = locked ? 'Unlock' : 'Locked';
+        }
+        if (lookupBtn) lookupBtn.disabled = locked;
+        renderDealerCard();
+      };
+      applyDealerLock(state.dealerLocked);
+
+      unlockBtn?.addEventListener('click', ()=>{
+        if (!state.dealer) return;
+        state.dealerLocked = false;
+        state.yard = null;
+        applyDealerLock(false);
+        updateSummary();
+        toast("Dealer unlocked", "Edit phone or name and lookup another.");
+      });
+
       $('btnDealerLookup').addEventListener('click', async ()=>{
         try{
+          const phoneVal = $('dealerPhone').value.trim();
+          const nameVal = $('dealerName').value.trim();
+          if (!phoneVal){
+            toast("Phone required", "Enter dealer phone first.");
+            return;
+          }
+          if (!nameVal){
+            toast("Dealer name required", "Provide the dealer name to continue.");
+            return;
+          }
           const fd = new FormData();
-          fd.append('phone', $('dealerPhone').value.trim());
-          fd.append('name', $('dealerName').value.trim());
+          fd.append('phone', phoneVal);
+          fd.append('name', nameVal);
           const data = await apiPost('dealer_lookup', fd);
           state.dealer = data.dealer;
+          state.dealerLocked = true;
+          state.yard = null;
           $('dealerStatus').textContent = state.dealer.full_name;
           $('dealerPhone').value = state.dealer.phone_e164 || '';
-          renderDealerCard();
+          applyDealerLock(true);
           toast(data.created ? "Dealer created" : "Dealer loaded", state.dealer.full_name);
           updateSummary();
           // auto advance
@@ -2547,16 +3151,20 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         const cardEl = $('yardCard');
         if (!cardEl) return;
         if (!state.yard){
-          cardEl.style.display = 'none';
-          cardEl.innerHTML = '';
-          return;
+          cardEl.classList.add('empty');
+          cardEl.innerHTML = `
+            <div class="scLabel">Yard</div>
+            <div class="scValue">No yard selected</div>
+            <div class="scSub">Tap a yard or continue without one.</div>
+          `;
+        } else {
+          cardEl.classList.remove('empty');
+          cardEl.innerHTML = `
+            <div class="scLabel">Yard</div>
+            <div class="scValue">${escapeHtml(state.yard.yard_name)}</div>
+            <div class="scSub">${escapeHtml(state.yard.town_name || 'Dealer yard')}</div>
+          `;
         }
-        cardEl.style.display = 'flex';
-        cardEl.innerHTML = `
-          <div class="scLabel">Yard</div>
-          <div class="scValue">${escapeHtml(state.yard.yard_name)}</div>
-          <div class="scSub">${escapeHtml(state.yard.town_name || 'Dealer yard')}</div>
-        `;
       };
       updateYardCard();
 
@@ -2568,11 +3176,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       (async ()=>{
         try{
           const yards = await loadYards(state.dealer.id);
+          yardOptions = yards.slice();
           const pillGrid = $('yardPills');
           pillGrid.innerHTML = '';
 
-          // "No yard" option
-          const none = pillEl({id:'', title:'No Yard', sub:'Skip yard attachment', kind:'car', key:'no-yard', selected: !state.yard});
+          const none = pillEl({id:'none', title:'No yard', sub:'Skip yard', kind:'building', key:'yard-none', selected: !state.yard});
           none.addEventListener('click', ()=>{
             selectSingleInGrid(pillGrid, none);
             state.yard = null;
@@ -2601,20 +3209,21 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             });
             pillGrid.appendChild(p);
           });
+          ensureStepAdvanceFallback(pillGrid, ()=> next());
 
         }catch(e){
           toast("Yards error", e.message);
         }
       })();
 
-      addBtn.addEventListener('click', ()=>{
+      let yardOptions = [];
+      const openAddYardModal = (prefillName='', prefillTown='')=>{
         if (!state.dealer) return;
-
         const townOpts = state.towns.map(t=>`<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
         openModal("Add yard", "Saved into car_yards (Title Case).", `
           <div>
             <div class="label">Yard name</div>
-            <input class="field mt-2" id="mYardName" placeholder="e.g. Uptown Autos">
+            <input class="field mt-2" id="mYardName" placeholder="e.g. Uptown Autos" value="${escapeHtml(prefillName)}">
             <div class="label mt-4">Town</div>
             <select class="field mt-2" id="mYardTown">
               <option value="">Select town…</option>
@@ -2627,32 +3236,57 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             </div>
           </div>
         `);
+        $('mYardTown').value = prefillTown;
 
-        $('mCancelYard').addEventListener('click', closeModal);
-        $('mSaveYard').addEventListener('click', async ()=>{
+        const saveYard = async ()=>{
           try{
             const name = $('mYardName').value.trim();
             const townId = $('mYardTown').value;
             if (!name) throw new Error('Yard name required');
             if (!townId) throw new Error('Town required');
+            const matches = findSimilarEntries(name, yardOptions, y=>y.yard_name, y=>y.town_name || '');
+            if (matches.length){
+              showSimilarityModal({
+                typeLabel: 'yard',
+                value: name,
+                matches,
+                onUseExisting: (match)=>{
+                  state.yard = {id: match.id, yard_name: match.yard_name, town_id: match.town_id, town_name: match.town_name};
+                  updateSummary();
+                  updateYardCard();
+                  next();
+                },
+                onOverride: () => proceedSave(name, townId),
+                onEdit: () => openAddYardModal(name, townId)
+              });
+              return;
+            }
+            await proceedSave(name, townId);
+          }catch(e){
+            toast("Add yard error", e.message);
+          }
+        };
 
+        const proceedSave = async (name, townId)=>{
+          try{
             const fd = new FormData();
             fd.append('dealer_id', state.dealer.id);
             fd.append('yard_name', name);
             fd.append('town_id', townId);
-
             const data = await apiPost('yard_add', fd);
             closeModal();
             toast("Yard saved", data.yard_name || name);
-
-            // refresh step
             fadeTo(()=>renderYard());
-
           }catch(e){
             toast("Add yard error", e.message);
           }
-        });
-      });
+        };
+
+        $('mCancelYard').addEventListener('click', closeModal);
+        $('mSaveYard').addEventListener('click', saveYard);
+      };
+
+      addBtn.addEventListener('click', ()=> openAddYardModal());
     }
 
     function renderMake(){
@@ -2666,36 +3300,54 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       `;
       wrap.appendChild(top);
 
-      const grid = document.createElement('div');
-      grid.className = 'mt-4 pillGrid';
-      grid.id = 'makeGrid';
-      wrap.appendChild(grid);
+      const sectionWrap = document.createElement('div');
+      wrap.appendChild(sectionWrap);
 
       setBodyNode(wrap);
 
-      const g = $('makeGrid');
-      g.innerHTML = '';
-      state.makes.forEach(m=>{
-        const p = pillEl({id: m.id, title: m.name, sub:'Make', kind:'car', key:'make-'+m.id, selected: state.make && String(state.make.id)===String(m.id)});
-        p.addEventListener('click', async ()=>{
-          selectSingleInGrid(g, p);
-          state.make = {id: m.id, name: m.name};
-          // reset downstream
-          state.model = null; state.year = null; state.body = null;
-          state.models = []; state.years = []; state.bodies = [];
-          await loadModels(m.id);
-          updateSummary();
-          next();
-        });
-        g.appendChild(p);
-      });
-      ensureStepAdvanceFallback(g, ()=> next());
+      const {common: commonMakes, rest: otherMakes} = partitionByPriority(state.makes, COMMON_MAKES, m=>m.name);
+      const sortedCommonMakes = orderByPriorityList(commonMakes, COMMON_MAKES, m=>m.name);
 
-      $('btnAddMake').addEventListener('click', ()=>{
+      const renderMakeSection = (title, items)=>{
+        if (!items.length) return null;
+        const heading = document.createElement('div');
+        heading.className = 'label mt-4';
+        heading.textContent = title.toUpperCase();
+        const grid = document.createElement('div');
+        grid.className = 'mt-2 pillGrid';
+        sectionWrap.appendChild(heading);
+        sectionWrap.appendChild(grid);
+        items.forEach(m=>{
+          const p = pillEl({id: m.id, title: m.name, sub:'Make', kind:'car', key:'make-'+m.id, selected: state.make && String(state.make.id)===String(m.id)});
+          p.addEventListener('click', async ()=>{
+            selectSingleInGrid(grid, p);
+            state.make = {id: m.id, name: m.name};
+            // reset downstream
+            state.model = null; state.year = null; state.body = null;
+            state.models = []; state.years = []; state.bodies = [];
+            state.priceStats = null;
+            await loadModels(m.id);
+            updateSummary();
+            next();
+          });
+          grid.appendChild(p);
+        });
+        return grid;
+      };
+
+      let firstGrid = null;
+      if (sortedCommonMakes.length){
+        firstGrid = renderMakeSection('Common makes', sortedCommonMakes);
+      }
+      const restGrid = renderMakeSection('All makes', otherMakes);
+      if (!firstGrid) firstGrid = restGrid;
+      if (firstGrid) ensureStepAdvanceFallback(firstGrid, ()=> next());
+
+      const openAddMakeModal = (prefill='')=>{
         openModal("Add make", "Saved into vehicle_makes (Title Case).", `
           <div>
             <div class="label">Make name</div>
-            <input class="field mt-2" id="mMakeName" placeholder="e.g. Toyota">
+            <input class="field mt-2" id="mMakeName" placeholder="e.g. Toyota" value="${escapeHtml(prefill)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveMake" type="button">Save make${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelMake" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -2703,26 +3355,51 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelMake').addEventListener('click', closeModal);
-        $('mSaveMake').addEventListener('click', async ()=>{
+        const proceedSave = async (name)=>{
           try{
-            const name = $('mMakeName').value.trim();
-            if (!name) throw new Error('Make name required');
-
             const fd = new FormData();
             fd.append('name', name);
             const data = await apiPost('make_add', fd);
             closeModal();
             toast("Make saved", data.name);
-
-            // reload makes and re-render step
             const makes = await apiGet({a:'makes'});
             state.makes = makes.makes || [];
             fadeTo(()=>renderMake());
           }catch(e){
             toast("Add make error", e.message);
           }
+        };
+        $('mSaveMake').addEventListener('click', async ()=>{
+          try{
+            const name = $('mMakeName').value.trim();
+            if (!name) throw new Error('Make name required');
+            const duplicates = findSimilarEntries(name, state.makes, m=>m.name);
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'make',
+                value: name,
+                matches: duplicates,
+                onUseExisting: async (match)=>{
+                  state.make = {id: match.id, name: match.name};
+                  state.model = null; state.year = null; state.body = null;
+                  state.models = []; state.years = []; state.bodies = [];
+                  state.priceStats = null;
+                  await loadModels(match.id);
+                  updateSummary();
+                  next();
+                },
+                onOverride: () => proceedSave(name),
+                onEdit: () => openAddMakeModal(name)
+              });
+              return;
+            }
+            await proceedSave(name);
+          }catch(e){
+            toast("Add make error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddMake').addEventListener('click', ()=> openAddMakeModal());
     }
 
     function renderModel(){
@@ -2741,36 +3418,55 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       `;
       wrap.appendChild(top);
 
-      const grid = document.createElement('div');
-      grid.className = 'mt-4 pillGrid';
-      grid.id = 'modelGrid';
-      wrap.appendChild(grid);
+      const sectionWrap = document.createElement('div');
+      wrap.appendChild(sectionWrap);
 
       setBodyNode(wrap);
 
-      const g = $('modelGrid');
-      g.innerHTML = '';
-      state.models.forEach(m=>{
-        const p = pillEl({id: m.id, title: m.name, sub:'Model', kind:'car', key:'model-'+m.id, selected: state.model && String(state.model.id)===String(m.id)});
-        p.addEventListener('click', async ()=>{
-          selectSingleInGrid(g, p);
-          state.model = {id: m.id, name: m.name};
-          // reset downstream
-          state.year = null; state.body = null;
-          state.years = []; state.bodies = [];
-          await Promise.all([loadYears(m.id), loadBodies(m.id)]);
-          updateSummary();
-          next();
-        });
-        g.appendChild(p);
-      });
-      ensureStepAdvanceFallback(g, ()=> next());
+      const makeKey = normalizeEntityName(state.make.name);
+      const preferredModels = COMMON_MODEL_MAP[makeKey] || [];
+      const {common: commonModels, rest: otherModels} = partitionByPriority(state.models, preferredModels, m=>m.name);
 
-      $('btnAddModel').addEventListener('click', ()=>{
+      const renderModelSection = (title, items)=>{
+        if (!items.length) return null;
+        const heading = document.createElement('div');
+        heading.className = 'label mt-4';
+        heading.textContent = title.toUpperCase();
+        const grid = document.createElement('div');
+        grid.className = 'mt-2 pillGrid';
+        sectionWrap.appendChild(heading);
+        sectionWrap.appendChild(grid);
+        items.forEach(m=>{
+          const p = pillEl({id: m.id, title: m.name, sub:'Model', kind:'car', key:'model-'+m.id, selected: state.model && String(state.model.id)===String(m.id)});
+          p.addEventListener('click', async ()=>{
+            selectSingleInGrid(grid, p);
+            state.model = {id: m.id, name: m.name};
+            // reset downstream
+            state.year = null; state.body = null;
+            state.years = []; state.bodies = [];
+            state.priceStats = null;
+            await Promise.all([loadYears(m.id), loadBodies(m.id)]);
+            updateSummary();
+            next();
+          });
+          grid.appendChild(p);
+        });
+        return grid;
+      };
+
+      let firstGrid = null;
+      if (commonModels.length){
+        firstGrid = renderModelSection('Common models', commonModels);
+      }
+      const restGrid = renderModelSection('All models', otherModels);
+      if (!firstGrid) firstGrid = restGrid;
+      if (firstGrid) ensureStepAdvanceFallback(firstGrid, ()=> next());
+
+      const openAddModelModal = (prefill='')=>{
         openModal("Add model", `Saved into vehicle_models for ${state.make.name} (Title Case).`, `
           <div>
             <div class="label">Model name</div>
-            <input class="field mt-2" id="mModelName" placeholder="e.g. Vitz">
+            <input class="field mt-2" id="mModelName" placeholder="e.g. Vitz" value="${escapeHtml(prefill)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveModel" type="button">Save model${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelModel" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -2778,11 +3474,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelModel').addEventListener('click', closeModal);
-        $('mSaveModel').addEventListener('click', async ()=>{
+        const proceedSave = async (name)=>{
           try{
-            const name = $('mModelName').value.trim();
-            if (!name) throw new Error('Model name required');
-
             const fd = new FormData();
             fd.append('make_id', state.make.id);
             fd.append('name', name);
@@ -2795,8 +3488,38 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           }catch(e){
             toast("Add model error", e.message);
           }
+        };
+        $('mSaveModel').addEventListener('click', async ()=>{
+          try{
+            const name = $('mModelName').value.trim();
+            if (!name) throw new Error('Model name required');
+            const duplicates = findSimilarEntries(name, state.models, m=>m.name);
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'model',
+                value: name,
+                matches: duplicates,
+                onUseExisting: async (match)=>{
+                  state.model = {id: match.id, name: match.name};
+                  state.year = null; state.body = null;
+                  state.years = []; state.bodies = [];
+                  state.priceStats = null;
+                  await Promise.all([loadYears(match.id), loadBodies(match.id)]);
+                  updateSummary();
+                  next();
+                },
+                onOverride: () => proceedSave(name),
+                onEdit: () => openAddModelModal(name)
+              });
+              return;
+            }
+            await proceedSave(name);
+          }catch(e){
+            toast("Add model error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddModel').addEventListener('click', ()=> openAddModelModal());
     }
 
     function renderYear(){
@@ -2824,12 +3547,13 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       g.innerHTML = '';
 
       // If years list empty, encourage adding
-      const years = (state.years || []).slice().sort((a,b)=>a-b);
+      const years = (state.years || []).slice().sort((a,b)=>b-a);
       years.forEach(y=>{
         const p = pillEl({id: y, title: String(y), sub:'Year', kind:'tag', key:'year-'+y, selected: state.year===y});
         p.addEventListener('click', ()=>{
           selectSingleInGrid(g, p);
           state.year = y;
+          state.priceStats = null;
           updateSummary();
           next();
         });
@@ -2837,11 +3561,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       });
       ensureStepAdvanceFallback(g, ()=> next());
 
-      $('btnAddYear').addEventListener('click', ()=>{
+      const openAddYearModal = (prefill='')=>{
         openModal("Add year", "Saved into vehicle_model_years for this model.", `
           <div>
             <div class="label">Year</div>
-            <input class="field mt-2" id="mYearVal" placeholder="e.g. 2014" inputmode="numeric">
+            <input class="field mt-2" id="mYearVal" placeholder="e.g. 2014" inputmode="numeric" value="${escapeHtml(prefill)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveYear" type="button">Save year${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelYear" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -2849,27 +3573,51 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelYear').addEventListener('click', closeModal);
-        $('mSaveYear').addEventListener('click', async ()=>{
+        const proceedSave = async (yearValue)=>{
           try{
-            const v = $('mYearVal').value.trim();
-            const y = Number(v);
-            if (!y || y < 1900 || y > 2100) throw new Error('Enter a valid year');
-
             const fd = new FormData();
             fd.append('model_id', state.model.id);
-            fd.append('year', String(y));
+            fd.append('year', String(yearValue));
             await apiPost('model_year_add', fd);
 
             closeModal();
-            toast("Year saved", String(y));
+            toast("Year saved", String(yearValue));
 
             await loadYears(state.model.id);
             fadeTo(()=>renderYear());
           }catch(e){
             toast("Add year error", e.message);
           }
+        };
+        $('mSaveYear').addEventListener('click', async ()=>{
+          try{
+            const v = $('mYearVal').value.trim();
+            const y = Number(v);
+            if (!y || y < 1900 || y > 2100) throw new Error('Enter a valid year');
+            const duplicates = findSimilarEntries(String(y), state.years, yr=>String(yr));
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'year',
+                value: String(y),
+                matches: duplicates,
+                onUseExisting: (match)=>{
+                  state.year = Number(match.item);
+                  state.priceStats = null;
+                  updateSummary();
+                  next();
+                },
+                onOverride: () => proceedSave(y),
+                onEdit: () => openAddYearModal(String(y))
+              });
+              return;
+            }
+            await proceedSave(y);
+          }catch(e){
+            toast("Add year error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddYear').addEventListener('click', ()=> openAddYearModal());
     }
 
     function renderBody(){
@@ -2908,11 +3656,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       });
       ensureStepAdvanceFallback(g, ()=> next());
 
-      $('btnAddBody').addEventListener('click', ()=>{
+      const openAddBodyModal = (prefill='')=>{
         openModal("Add body type", "Saved into vehicle_model_bodies (Title Case).", `
           <div>
             <div class="label">Body type</div>
-            <input class="field mt-2" id="mBodyVal" placeholder="e.g. SUV">
+            <input class="field mt-2" id="mBodyVal" placeholder="e.g. SUV" value="${escapeHtml(prefill)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveBody" type="button">Save body${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelBody" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -2920,14 +3668,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelBody').addEventListener('click', closeModal);
-        $('mSaveBody').addEventListener('click', async ()=>{
+        const proceedSave = async (val)=>{
           try{
-            const v = $('mBodyVal').value.trim();
-            if (!v) throw new Error('Body type required');
-
             const fd = new FormData();
             fd.append('model_id', state.model.id);
-            fd.append('body_type', v);
+            fd.append('body_type', val);
             const data = await apiPost('model_body_add', fd);
 
             closeModal();
@@ -2938,8 +3683,34 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           }catch(e){
             toast("Add body error", e.message);
           }
+        };
+        $('mSaveBody').addEventListener('click', async ()=>{
+          try{
+            const v = $('mBodyVal').value.trim();
+            if (!v) throw new Error('Body type required');
+            const duplicates = findSimilarEntries(v, state.bodies, body=>body);
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'body type',
+                value: v,
+                matches: duplicates,
+                onUseExisting: (match)=>{
+                  state.body = match.item;
+                  updateSummary();
+                  next();
+                },
+                onOverride: () => proceedSave(v),
+                onEdit: () => openAddBodyModal(v)
+              });
+              return;
+            }
+            await proceedSave(v);
+          }catch(e){
+            toast("Add body error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddBody').addEventListener('click', ()=> openAddBodyModal());
     }
 
     function renderTown(){
@@ -2951,33 +3722,48 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       top.innerHTML = `<button class="btnAdd" type="button" id="btnAddTown">Add town${ICON_ARROW_RIGHT}</button>`;
       wrap.appendChild(top);
 
-      const grid = document.createElement('div');
-      grid.className = 'mt-4 pillGrid';
-      grid.id = 'townGrid';
-      wrap.appendChild(grid);
+      const sectionWrap = document.createElement('div');
+      wrap.appendChild(sectionWrap);
 
       setBodyNode(wrap);
 
-      const g = $('townGrid');
-      g.innerHTML = '';
+      const {common: commonTowns, rest: otherTowns} = partitionByPriority(state.towns, COMMON_TOWNS, t=>t.name);
 
-      state.towns.forEach(t=>{
-        const p = pillEl({id: t.id, title: t.name, sub:'Town', kind:'pin', key:'town-'+t.id, selected: state.town && String(state.town.id)===String(t.id)});
-        p.addEventListener('click', ()=>{
-          selectSingleInGrid(g, p);
-          state.town = {id: t.id, name: t.name};
-          updateSummary();
-          next();
+      const renderTownSection = (title, items)=>{
+        if (!items.length) return null;
+        const heading = document.createElement('div');
+        heading.className = 'label mt-4';
+        heading.textContent = title.toUpperCase();
+        const grid = document.createElement('div');
+        grid.className = 'mt-2 pillGrid';
+        sectionWrap.appendChild(heading);
+        sectionWrap.appendChild(grid);
+        items.forEach(t=>{
+          const p = pillEl({id: t.id, title: t.name, sub:'Town', kind:'pin', key:'town-'+t.id, selected: state.town && String(state.town.id)===String(t.id)});
+          p.addEventListener('click', ()=>{
+            selectSingleInGrid(grid, p);
+            state.town = {id: t.id, name: t.name};
+            updateSummary();
+            next();
+          });
+          grid.appendChild(p);
         });
-        g.appendChild(p);
-      });
-      ensureStepAdvanceFallback(g, ()=> next());
+        return grid;
+      };
 
-      $('btnAddTown').addEventListener('click', ()=>{
+      let firstGrid = null;
+      if (commonTowns.length){
+        firstGrid = renderTownSection('Common locations', commonTowns);
+      }
+      const restGrid = renderTownSection('All locations', otherTowns);
+      if (!firstGrid) firstGrid = restGrid;
+      if (firstGrid) ensureStepAdvanceFallback(firstGrid, ()=> next());
+
+      const openAddTownModal = (prefill='')=>{
         openModal("Add town", "Saved into towns (Title Case).", `
           <div>
             <div class="label">Town name</div>
-            <input class="field mt-2" id="mTownName" placeholder="e.g. Nairobi West">
+            <input class="field mt-2" id="mTownName" placeholder="e.g. Nairobi West" value="${escapeHtml(prefill)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveTown" type="button">Save town${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelTown" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -2985,11 +3771,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelTown').addEventListener('click', closeModal);
-        $('mSaveTown').addEventListener('click', async ()=>{
+        const proceedSave = async (name)=>{
           try{
-            const name = $('mTownName').value.trim();
-            if (!name) throw new Error('Town name required');
-
             const fd = new FormData();
             fd.append('name', name);
             const data = await apiPost('town_add', fd);
@@ -3002,8 +3785,34 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           }catch(e){
             toast("Add town error", e.message);
           }
+        };
+        $('mSaveTown').addEventListener('click', async ()=>{
+          try{
+            const name = $('mTownName').value.trim();
+            if (!name) throw new Error('Town name required');
+            const duplicates = findSimilarEntries(name, state.towns, t=>t.name);
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'town',
+                value: name,
+                matches: duplicates,
+                onUseExisting: (match)=>{
+                  state.town = {id: match.id, name: match.name};
+                  updateSummary();
+                  next();
+                },
+                onOverride: () => proceedSave(name),
+                onEdit: () => openAddTownModal(name)
+              });
+              return;
+            }
+            await proceedSave(name);
+          }catch(e){
+            toast("Add town error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddTown').addEventListener('click', ()=> openAddTownModal());
     }
 
     function renderPricing(){
@@ -3011,20 +3820,36 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       setBody(`
         <div>
           <div class="label">Cash price (KES)</div>
-          <input class="field mt-2" id="priceKes" inputmode="numeric" placeholder="e.g. 780000" value="${state.price ?? ''}">
+          <input class="field mt-2" id="priceKes" inputmode="numeric" placeholder="e.g. 780000" value="${state.price ? Number(state.price).toLocaleString() : ''}">
         </div>
-        <div class="infoNote mt-4">
-          <div class="infoTitle">Auto settings</div>
-          <div class="infoText">Expiry is fixed at 30 days and Sponsorship stays off for quick publishing. Adjust later in CMS if needed.</div>
+        <div class="callout mt-4">
+          <div class="calloutTitle">Auto settings</div>
+          <div class="calloutText">Expiry is fixed at 30 days and sponsorship stays off for quick publishing. Adjust later in CMS if needed.</div>
+        </div>
+        <div class="callout mt-4" id="priceStatsBox" style="display:none;">
+          <div class="calloutTitle">Selling range</div>
+          <div class="calloutText">Looking up similar listings…</div>
         </div>
       `);
 
-      $('priceKes').addEventListener('input', ()=>{
-        const v = $('priceKes').value.replace(/[^\d]/g,'');
-        $('priceKes').value = v;
-        state.price = v ? Number(v) : null;
+      const priceField = $('priceKes');
+      const formatCommas = (val)=>{
+        if (!val) return '';
+        const num = Number(val);
+        if (!Number.isFinite(num)) return '';
+        return num.toLocaleString();
+      };
+      priceField.addEventListener('input', ()=>{
+        const digits = priceField.value.replace(/[^\d]/g,'');
+        state.price = digits ? Number(digits) : null;
+        priceField.value = digits ? formatCommas(digits) : '';
         updateSummary();
       });
+      priceField.addEventListener('blur', ()=>{
+        priceField.value = state.price ? formatCommas(state.price) : '';
+      });
+      updatePriceStatsUI();
+      loadPriceStats();
     }
 
     function renderEngineStep(){
@@ -3078,7 +3903,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       ];
       const fg = $('fuelGrid');
       fuelOpts.forEach(o=>{
-        const p = pillEl({id:o.v, title:o.t, sub:'Tap to select', kind:o.kind, key:'fuel-'+o.v, selected: state.fuel===o.v});
+        const p = pillEl({id:o.v, title:o.t, sub:'', kind:o.kind, key:'fuel-'+o.v, selected: state.fuel===o.v});
         p.addEventListener('click', ()=>{
           selectSingleInGrid(fg, p);
           state.fuel = o.v;
@@ -3107,7 +3932,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       ];
       const tg = $('transGrid');
       transOpts.forEach(o=>{
-        const p = pillEl({id:o.v, title:o.t, sub:'Tap to select', kind:o.kind, key:'trans-'+o.v, selected: state.trans===o.v});
+        const p = pillEl({id:o.v, title:o.t, sub:'', kind:o.kind, key:'trans-'+o.v, selected: state.trans===o.v});
         p.addEventListener('click', ()=>{
           selectSingleInGrid(tg, p);
           state.trans = o.v;
@@ -3120,7 +3945,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
 
     function renderColorStep(){
-      setQuestion("Color", "Tap a color swatch or add your own.");
+      setQuestion("Color", "Tap a swatch or add a custom one.");
       const colors = [
         "White","Black","Silver","Grey","Blue","Red","Green","Beige","Brown","Gold","Orange","Purple"
       ];
@@ -3139,32 +3964,28 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       `;
       setBodyNode(wrap);
       const cg = $('colorGrid');
-      function renderColors(arr){
+      const renderColors = (arr)=>{
         cg.innerHTML = '';
         arr.forEach(c=>{
-          const sw = document.createElement('button');
-          sw.type = 'button';
-          sw.className = 'colorSwatch';
-          sw.setAttribute('aria-selected', state.color===c ? 'true':'false');
-          const cssColor = colorValueFromName(c);
-          const ink = isLightColor(cssColor) ? '#0f172a' : '#f8fafc';
-          sw.style.setProperty('--swatch-color', cssColor);
-          sw.style.setProperty('--swatch-ink', ink);
-          sw.innerHTML = `
-            <div class="colorSwatchMeta">
-              <div class="colorName">${escapeHtml(c)}</div>
-              <div class="colorHint">${state.color===c ? 'Selected' : 'Tap to select'}</div>
-            </div>
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'colorChip';
+          const cssColor = colorValueFromName(c) || '#fff';
+          btn.setAttribute('aria-selected', state.color===c ? 'true' : 'false');
+          btn.style.setProperty('--color-chip', cssColor);
+          btn.innerHTML = `
+            <span class="colorChipSwatch" style="background:${cssColor}; border-color:${cssColor};"></span>
+            <span class="colorChipLabel">${escapeHtml(c)}</span>
           `;
-          sw.addEventListener('click', ()=>{
+          btn.addEventListener('click', ()=>{
             state.color = c;
             renderColors(arr);
             updateSummary();
             next();
           });
-          cg.appendChild(sw);
+          cg.appendChild(btn);
         });
-      }
+      };
       renderColors(colors);
       $('btnAddColor').addEventListener('click', ()=>{
         openModal("Add color", "Stored only on this listing.", `
@@ -3201,7 +4022,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <div class="label">Title (optional)</div>
-              <input class="field mt-2" id="title" placeholder="${escapeHtml(autoTitle())}" value="${escapeHtml(state.title || autoTitle())}">
+              <input class="field mt-2" id="title" autocomplete="off">
             </div>
             <div>
               <div class="label">Trim (optional)</div>
@@ -3212,18 +4033,42 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
               <textarea class="field mt-2" id="desc" rows="3" placeholder="Optional notes...">${escapeHtml(state.description || '')}</textarea>
             </div>
           </div>
-          <div class="infoNote mt-4">
-            <div class="infoTitle">Auto title</div>
-            <div class="infoText" id="autoTitlePreview">${escapeHtml(autoTitle())}</div>
+          <div class="callout calloutAccent mt-4">
+            <div class="calloutTitle">Auto title</div>
+            <div class="calloutText" id="autoTitlePreview">${escapeHtml(autoTitle())}</div>
           </div>
         </div>
       `;
       setBodyNode(wrap);
-      $('title').addEventListener('input', ()=>{
-        state.title = $('title').value;
+      const titleInput = $('title');
+      const syncTitleField = ()=>{
+        const useAuto = !state.title;
+        titleInput.value = useAuto ? autoTitle() : state.title;
+        titleInput.dataset.auto = useAuto ? '1' : '0';
+        titleInput.classList.toggle('autoFill', useAuto);
         const preview = $('autoTitlePreview');
         if (preview) preview.textContent = autoTitle();
         updateSummary();
+      };
+      syncTitleField();
+      titleInput.addEventListener('focus', ()=>{
+        if (titleInput.dataset.auto === '1'){
+          requestAnimationFrame(()=> titleInput.select());
+        }
+      });
+      titleInput.addEventListener('blur', ()=>{
+        if (!titleInput.value.trim()){
+          state.title = '';
+          syncTitleField();
+        }
+      });
+      titleInput.addEventListener('input', ()=>{
+        titleInput.dataset.auto = '0';
+        titleInput.classList.remove('autoFill');
+        state.title = titleInput.value.trim();
+        updateSummary();
+        const preview = $('autoTitlePreview');
+        if (preview) preview.textContent = autoTitle();
       });
       $('trim').addEventListener('input', ()=>{
         state.trim = $('trim').value;
@@ -3346,7 +4191,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
 
     function renderFeatures(){
-      setQuestion("Any features?", "Tap to select multiple. Add a new feature option if missing.");
+      setQuestion("Any features?", "Multi-select quick highlights. Add a new option if missing.");
       const wrap = document.createElement('div');
 
       wrap.innerHTML = `
@@ -3383,13 +4228,13 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       });
       ensureStepAdvanceFallback(g, ()=> next());
 
-      $('btnAddFeature').addEventListener('click', ()=>{
+      const openAddFeatureModal = (prefillLabel='', prefillTag='')=>{
         openModal("Add feature", "Saved into settings[pipii_features] (Title Case label).", `
           <div>
             <div class="label">Feature label</div>
-            <input class="field mt-2" id="mFeatLabel" placeholder="e.g. Reverse Camera">
+            <input class="field mt-2" id="mFeatLabel" placeholder="e.g. Reverse Camera" value="${escapeHtml(prefillLabel)}">
             <div class="label mt-4">Tag (optional)</div>
-            <input class="field mt-2" id="mFeatTag" placeholder="e.g. reverse_camera">
+            <input class="field mt-2" id="mFeatTag" placeholder="e.g. reverse_camera" value="${escapeHtml(prefillTag)}">
             <div class="mt-4 flex gap-2">
               <button class="btn btnSolid" id="mSaveFeat" type="button">Save feature${ICON_ARROW_RIGHT}</button>
               <button class="btn btnGhost" id="mCancelFeat" type="button">Cancel${ICON_ARROW_LEFT}</button>
@@ -3397,12 +4242,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
         `);
         $('mCancelFeat').addEventListener('click', closeModal);
-        $('mSaveFeat').addEventListener('click', async ()=>{
+        const proceedSave = async (label, tag)=>{
           try{
-            const label = $('mFeatLabel').value.trim();
-            const tag = $('mFeatTag').value.trim();
-            if (!label && !tag) throw new Error('Provide label or tag');
-
             const fd = new FormData();
             fd.append('label', label);
             fd.append('tag', tag);
@@ -3417,8 +4258,39 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           }catch(e){
             toast("Add feature error", e.message);
           }
+        };
+        $('mSaveFeat').addEventListener('click', async ()=>{
+          try{
+            const label = $('mFeatLabel').value.trim();
+            const tag = $('mFeatTag').value.trim();
+            if (!label && !tag) throw new Error('Provide label or tag');
+            const display = label || tag;
+            const duplicates = findSimilarEntries(display, state.features, f=>f.label || f.tag);
+            if (duplicates.length){
+              showSimilarityModal({
+                typeLabel: 'feature',
+                value: display,
+                matches: duplicates,
+                onUseExisting: (match)=>{
+                  const tagVal = match.item?.tag;
+                  if (!tagVal) return;
+                  const set = new Set(state.selectedFeatures || []);
+                  set.add(tagVal);
+                  state.selectedFeatures = Array.from(set);
+                  updateSummary();
+                },
+                onOverride: () => proceedSave(label, tag),
+                onEdit: () => openAddFeatureModal(label, tag)
+              });
+              return;
+            }
+            await proceedSave(label, tag);
+          }catch(e){
+            toast("Add feature error", e.message);
+          }
         });
-      });
+      };
+      $('btnAddFeature').addEventListener('click', ()=> openAddFeatureModal());
     }
 
     function renderPhotos(){
@@ -3511,14 +4383,86 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       renderGrid();
     }
 
+    async function submitListing(){
+      if (isPublishing) return;
+      try{
+        isPublishing = true;
+        if (!state.dealer) throw new Error("Dealer is required");
+        if (!state.town) throw new Error("Town is required");
+        if (!state.model) throw new Error("Model is required");
+        if (!state.year) throw new Error("Year is required");
+        if (!state.engine) throw new Error("Engine (cc) is required");
+        if (!state.price) throw new Error("Price is required");
+
+        await confirmDealerPublish(state.dealer.full_name || '');
+
+        const fd = new FormData();
+        fd.append('dealer_id', state.dealer.id);
+        fd.append('yard_id', state.yard ? state.yard.id : '');
+        fd.append('town_id', state.town.id);
+        fd.append('vehicle_model_id', state.model.id);
+
+        fd.append('year', String(state.year));
+        fd.append('engine_cc', String(state.engine));
+        fd.append('mileage_km', state.mileage ? String(state.mileage) : '');
+        fd.append('cash_price_kes', String(state.price));
+
+        fd.append('fuel_type', state.fuel || '');
+        fd.append('transmission', state.trans || '');
+        fd.append('body_type', state.body || '');
+        fd.append('color', state.color || '');
+
+        fd.append('condition_type', state.condition || 'used');
+
+        fd.append('title', state.title || autoTitle());
+        fd.append('trim', state.trim || '');
+        fd.append('description', state.description || '');
+
+        fd.append('allows_cash', state.sale.cash ? '1' : '0');
+        fd.append('allows_hp', state.sale.hp ? '1' : '0');
+        fd.append('allows_trade_in', state.sale.trade ? '1' : '0');
+        fd.append('allows_external_financing', state.sale.external ? '1' : '0');
+
+        fd.append('features', JSON.stringify(state.selectedFeatures || []));
+
+        fd.append('hp_on', state.sale.hp ? '1' : '0');
+        const hpDepositVal = state.hp.deposit ? String(state.hp.deposit) : '';
+        const hpMonthsVal = state.hp.months ? String(state.hp.months) : '';
+        fd.append('hp_min_deposit', hpDepositVal);
+        fd.append('hp_max_deposit', hpDepositVal);
+        fd.append('hp_min_months', hpMonthsVal || '3');
+        fd.append('hp_max_months', hpMonthsVal || '3');
+        fd.append('hp_notes', state.hp.notes || '');
+
+        state.photos.forEach(p=> fd.append('photos[]', p.file, p.file.name));
+
+        const dealerName = state.dealer ? state.dealer.full_name : '';
+        const data = await apiPost('listing_create', fd);
+        hardReset(false);
+        stepIndex = 0;
+        setProgress();
+        fadeTo(()=>renderCurrent());
+        showPublishSuccessModal(data.listing_id, dealerName);
+      }catch(e){
+        if (e && e.message === PUBLISH_CANCELLED){
+          toast("Publish cancelled", "Listing was not saved.");
+        } else {
+          toast("Cannot list", e?.message || 'Unknown error');
+        }
+      }finally{
+        isPublishing = false;
+      }
+    }
+
     function renderReview(){
       setQuestion("Review and list now", "A final quick card. When you tap List Now, the database is populated.");
       const car = (state.make && state.model) ? `${state.make.name} ${state.model.name}` : '—';
-      const yb = `${state.year || '—'} • ${state.body || '—'}`;
       const town = state.town ? state.town.name : '—';
       const price = state.price ? `KES ${Number(state.price).toLocaleString()}` : '—';
       const em = `${state.engine ? state.engine+'cc' : '—'} • ${state.mileage ? Number(state.mileage).toLocaleString()+'km' : '—'}`;
-      const ft = `${state.fuel || '—'} • ${state.trans || '—'}`;
+      const fuelLabel = state.fuel ? niceLabel(state.fuel) : '—';
+      const transLabel = state.trans ? niceLabel(state.trans) : '—';
+      const ft = `${fuelLabel} • ${transLabel}`;
       const color = state.color || '—';
 
       const sale = [];
@@ -3538,7 +4482,6 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div><span class="text-white/55">Yard:</span> <span class="font-semibold">${escapeHtml(state.yard ? state.yard.yard_name : '—')}</span></div>
 
             <div><span class="text-white/55">Car:</span> <span class="font-semibold">${escapeHtml(car)}</span></div>
-            <div><span class="text-white/55">Year/Body:</span> <span class="font-semibold">${escapeHtml(yb)}</span></div>
 
             <div><span class="text-white/55">Town:</span> <span class="font-semibold">${escapeHtml(town)}</span></div>
             <div><span class="text-white/55">Price:</span> <span class="font-semibold">${escapeHtml(price)}</span></div>
@@ -3558,7 +4501,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
           <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
             <button class="btn btnGhost" type="button" id="btnReviewBack">Go back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
-            <button class="btn btnSolid" type="button" id="btnListNow">List now<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+            <button class="btn btnSolid btnGreen" type="button" id="btnListNow">List now<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
           </div>
         </div>
       `;
@@ -3566,74 +4509,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       $('btnReviewBack').addEventListener('click', ()=> back());
 
-      $('btnListNow').addEventListener('click', async ()=>{
-        try{
-          // Minimal validation for schema truth:
-          if (!state.dealer) throw new Error("Dealer is required");
-          if (!state.town) throw new Error("Town is required");
-          if (!state.model) throw new Error("Model is required");
-          if (!state.year) throw new Error("Year is required");
-          if (!state.engine) throw new Error("Engine (cc) is required");
-          if (!state.price) throw new Error("Price is required");
-
-          await confirmDealerPublish(state.dealer.full_name || '');
-
-          const fd = new FormData();
-          fd.append('dealer_id', state.dealer.id);
-          fd.append('yard_id', state.yard ? state.yard.id : '');
-          fd.append('town_id', state.town.id);
-          fd.append('vehicle_model_id', state.model.id);
-
-          fd.append('year', String(state.year));
-          fd.append('engine_cc', String(state.engine));
-          fd.append('mileage_km', state.mileage ? String(state.mileage) : '');
-          fd.append('cash_price_kes', String(state.price));
-
-          fd.append('fuel_type', state.fuel || '');
-          fd.append('transmission', state.trans || '');
-          fd.append('body_type', state.body || '');
-          fd.append('color', state.color || '');
-
-          fd.append('condition_type', state.condition || 'used');
-
-          fd.append('title', state.title || autoTitle());
-          fd.append('trim', state.trim || '');
-          fd.append('description', state.description || '');
-
-          fd.append('allows_cash', state.sale.cash ? '1' : '0');
-          fd.append('allows_hp', state.sale.hp ? '1' : '0');
-          fd.append('allows_trade_in', state.sale.trade ? '1' : '0');
-          fd.append('allows_external_financing', state.sale.external ? '1' : '0');
-
-          fd.append('features', JSON.stringify(state.selectedFeatures || []));
-
-          fd.append('hp_on', state.sale.hp ? '1' : '0');
-          const hpDepositVal = state.hp.deposit ? String(state.hp.deposit) : '';
-          const hpMonthsVal = state.hp.months ? String(state.hp.months) : '';
-          fd.append('hp_min_deposit', hpDepositVal);
-          fd.append('hp_max_deposit', hpDepositVal);
-          fd.append('hp_min_months', hpMonthsVal || '3');
-          fd.append('hp_max_months', hpMonthsVal || '3');
-          fd.append('hp_notes', state.hp.notes || '');
-
-          state.photos.forEach(p=> fd.append('photos[]', p.file, p.file.name));
-
-          const data = await apiPost('listing_create', fd);
-          toast("Listing saved", "ID #" + data.listing_id);
-
-          // Reset for next entry
-          hardReset(false);
-          stepIndex = 0;
-          setProgress();
-          fadeTo(()=>renderCurrent());
-        }catch(e){
-          if (e && e.message === PUBLISH_CANCELLED){
-            toast("Publish cancelled", "Listing was not saved.");
-            return;
-          }
-          toast("Cannot list", e?.message || 'Unknown error');
-        }
-      });
+      $('btnListNow').addEventListener('click', submitListing);
     }
 
     /* ---------- Helpers ---------- */
@@ -3701,7 +4577,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (step === "trans") return true;
       if (step === "color") return true;
       if (step === "extras") return true;
-      if (step === "condition") return true;
+      if (step === "condition") return !!state.condition;
       if (step === "sale") {
         if (state.sale.hp && (!state.hp.deposit || !state.hp.months)) return false;
         return true;
@@ -3713,6 +4589,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
 
     function next(){
+      const step = steps[stepIndex];
+      if (step === 'review'){
+        submitListing();
+        return;
+      }
       if (!canNext()){
         toast("Incomplete step", "Please complete this step before continuing.");
         return;
@@ -3736,6 +4617,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       state.dealer = null;
       state.yard = null;
+      state.dealerLocked = false;
 
       state.make = null;
       state.model = null;
@@ -3750,7 +4632,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       state.fuel = null;
       state.trans = null;
       state.color = null;
-      state.condition = "used";
+      state.condition = null;
 
       state.sale = {cash:true, hp:false, trade:false, external:false};
       state.hp = {deposit:null, months:12, notes:''};
@@ -3760,6 +4642,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       state.title = '';
       state.trim = '';
       state.description = '';
+      state.priceStats = null;
       previewSlideIndex = 0;
 
       if (showToast) toast("Reset", "All selections cleared.");
@@ -3818,22 +4701,3 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
   </script>
 </body>
 </html>
-    .infoNote{
-      border-radius: 16px;
-      border: 1px solid rgba(255,255,255,.08);
-      background: rgba(255,255,255,.03);
-      padding: 14px;
-    }
-    .infoNote .infoTitle{
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: .16em;
-      color: rgba(255,255,255,.65);
-    }
-    .infoNote .infoText{
-      margin-top: 6px;
-      font-size: 13px;
-      color: rgba(255,255,255,.78);
-      line-height: 1.45;
-    }

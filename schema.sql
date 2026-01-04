@@ -55,6 +55,18 @@ CREATE TABLE `events` (
   `created_at` datetime NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+CREATE TABLE `notifications` (
+  `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `recipient_phone` varchar(32) NOT NULL,
+  `body` text NOT NULL,
+  `meta` json DEFAULT NULL,
+  `status` enum('pending','sent','failed') NOT NULL DEFAULT 'pending',
+  `created_at` datetime NOT NULL DEFAULT current_timestamp(),
+  `sent_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_notifications_recipient_phone` (`recipient_phone`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 -- --------------------------------------------------------
 
 --
