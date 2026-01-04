@@ -120,6 +120,33 @@ function clean_str($v, int $max=255): string {
   return (string)$v;
 }
 
+function normalize_ke_phone(string $input): string {
+  $raw = trim($input);
+  if ($raw === '') return '';
+
+  $compact = preg_replace('/\s+/', '', $raw);
+  if (preg_match('/^\+254(7|1)\d{8}$/', $compact)) {
+    return $compact;
+  }
+
+  $digits = preg_replace('/\D+/', '', $compact);
+  if ($digits === '') return '';
+
+  // strip country code if present
+  if (strpos($digits, '254') === 0 && strlen($digits) >= 12) {
+    $digits = substr($digits, 3);
+  }
+  // strip leading zero for local 07/01 formats
+  if (strpos($digits, '0') === 0 && strlen($digits) === 10) {
+    $digits = substr($digits, 1);
+  }
+
+  if (preg_match('/^(7|1)\d{8}$/', $digits)) {
+    return '+254' . $digits;
+  }
+  return '';
+}
+
 function intv($v, ?int $min=null, ?int $max=null): ?int {
   if ($v === null || $v === '') return null;
   if (!is_numeric($v)) return null;
@@ -465,9 +492,10 @@ if ($action === "feature_add") {
 if ($action === "dealer_lookup") {
   if (!is_post()) json_out(["ok"=>false,"error"=>"POST required"], 405);
 
-  $phone = clean_str($_POST["phone"] ?? "", 20);
+  $phoneRaw = clean_str($_POST["phone"] ?? "", 32);
+  $phone = normalize_ke_phone($phoneRaw);
   $name  = title_case(clean_str($_POST["name"] ?? "", 140));
-  if ($phone === "") json_out(["ok"=>false,"error"=>"Phone required"], 422);
+  if ($phone === "") json_out(["ok"=>false,"error"=>"Enter a Kenyan phone (07 / 01 / +254 formats)"], 422);
 
   $pdo = db();
   $st = $pdo->prepare("SELECT id, full_name, phone_e164, role FROM users WHERE phone_e164=? LIMIT 1");
@@ -873,7 +901,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
     .btn{
       border-radius: 16px;
-      padding: 12px 14px;
+      padding: 12px 16px;
       font-size: 13px;
       font-weight: 700;
       border: 1px solid rgba(255,255,255,.12);
@@ -882,6 +910,10 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       transition: transform .08s, background .14s, border-color .14s;
       user-select:none;
       min-height: 44px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap: 8px;
     }
     .btn:hover{ background: rgba(255,255,255,.10); border-color: rgba(255,255,255,.18); }
     .btn:active{ transform: translateY(1px); }
@@ -890,7 +922,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     .btnGhost{ background: transparent; border-color: rgba(255,255,255,.10); }
     .btnDanger{ background: rgba(244,63,94,.14); border-color: rgba(244,63,94,.30); color: rgba(255,220,230,.95); }
     .btnAdd{
-      padding: 10px 12px;
+      padding: 10px 14px;
       border-radius: 14px;
       border: 1px dashed rgba(255,255,255,.18);
       background: rgba(255,255,255,.035);
@@ -898,8 +930,398 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       font-weight: 700;
       font-size: 12px;
       min-height: 44px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap: 8px;
     }
     .btnAdd:hover{ border-color: rgba(255,255,255,.28); background: rgba(255,255,255,.05); }
+
+    .selectedCard{
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.035);
+      padding: 12px 14px;
+      min-width: 220px;
+      color: rgba(255,255,255,.9);
+      box-shadow: 0 12px 28px rgba(0,0,0,.25);
+      display:flex;
+      flex-direction:column;
+      gap: 4px;
+    }
+    .selectedCard .scLabel{
+      font-size: 10px;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.6);
+    }
+    .selectedCard .scValue{
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .selectedCard .scSub{
+      font-size: 12px;
+      color: rgba(255,255,255,.7);
+    }
+    .dealerAccent{
+      display:inline-flex;
+      align-items:center;
+      gap: 6px;
+      padding: 2px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.12);
+      color: rgba(255,255,255,.95);
+      font-weight: 800;
+      letter-spacing: .01em;
+    }
+    .btnIconTail{
+      display:inline-flex;
+      margin-left: 8px;
+    }
+    .btnIconTail svg{
+      width: 12px;
+      height: 12px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+    }
+    .previewCard{
+      border-radius: 24px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(12,14,20,.8);
+      backdrop-filter: blur(16px);
+      box-shadow: 0 25px 80px rgba(0,0,0,.35);
+      overflow:hidden;
+    }
+    .previewSliderWrap{
+      position:absolute;
+      bottom: 16px;
+      left: 20px;
+      right: 20px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      z-index: 2;
+    }
+    .previewSliderDots{ display:flex; gap:6px; }
+    .previewDot{
+      width:8px; height:8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.22);
+      transition: width .14s ease, background .14s ease;
+    }
+    .previewDot.active{
+      width: 22px;
+      background: rgba(255,255,255,.92);
+    }
+    .previewSliderMeta{
+      font-size: 12px;
+      color: rgba(255,255,255,.7);
+    }
+    .sliderCaret{
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.35);
+      background: rgba(0,0,0,.45);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      cursor:pointer;
+      color: rgba(255,255,255,.92);
+      transition: background .14s, border-color .14s, transform .14s;
+    }
+    .sliderCaret:disabled{
+      opacity: .35;
+      cursor:not-allowed;
+    }
+    .sliderCaret svg{
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      stroke-width: 2.2;
+      fill: none;
+    }
+    .sliderCaret:hover{
+      background: rgba(0,0,0,.65);
+      border-color: rgba(255,255,255,.6);
+    }
+    .previewMedia{
+      width:100%;
+      height: 220px;
+      background: linear-gradient(130deg, rgba(59,130,246,.35), rgba(15,23,42,.95));
+      background-size: cover;
+      background-position: center;
+      position:relative;
+      border-radius: 24px 24px 0 0;
+      overflow:hidden;
+    }
+    .previewMediaHint{
+      position:absolute;
+      inset:0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size: 12px;
+      color: rgba(255,255,255,.75);
+      text-transform: uppercase;
+      letter-spacing: .18em;
+      background: rgba(0,0,0,.15);
+      border-radius: 0;
+      z-index: 1;
+    }
+    .previewMedia.has-photo .previewMediaHint{ display:none; }
+    .previewBody{
+      padding: 24px;
+      display:flex;
+      flex-direction:column;
+      gap: 16px;
+    }
+    .previewHeader{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 12px;
+    }
+    .previewTitle{ font-size: 18px; font-weight: 800; color:#fff; }
+    .previewMeta{ font-size: 12px; color: rgba(255,255,255,.6); margin-top: 4px; }
+    .previewPrice{ font-size: 22px; font-weight: 800; color: #fff; }
+    .previewDealer{ font-size: 12px; color: rgba(255,255,255,.7); }
+    .placeholder{ color: rgba(255,255,255,.4)!important; }
+    .previewSpecChips,
+    .previewFeatureChips{
+      display:flex;
+      flex-wrap:wrap;
+      gap: 8px;
+    }
+    .previewChip{
+      display:inline-flex;
+      align-items:center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.1);
+      background: rgba(255,255,255,.04);
+      font-size: 11px;
+      font-weight: 700;
+      color: rgba(255,255,255,.92);
+    }
+    .previewChip .chipIcon{
+      display:flex;
+      align-items:center;
+    }
+    .previewChip .chipIcon svg{
+      width: 12px;
+      height: 12px;
+    }
+    .previewChip .chipLabel{ font-weight: 600; opacity: .65; margin-right: 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
+    .previewChip.colorful{
+      background: var(--chip-color, rgba(255,255,255,.1));
+      border-color: rgba(255,255,255,.18);
+      color: var(--chip-ink,#fff);
+    }
+    .previewChip .chipIcon svg{ stroke: currentColor; }
+    .previewSale{
+      border-top: 1px solid rgba(255,255,255,.08);
+      padding-top: 14px;
+      display:flex;
+      flex-direction:column;
+      gap: 10px;
+    }
+    .previewSaleTitle{
+      font-size: 11px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.55);
+    }
+    .previewSaleBadges{
+      display:flex;
+      flex-wrap:wrap;
+      gap: 8px;
+    }
+    .previewSaleBadge{
+      font-size: 11px;
+      font-weight: 700;
+      padding: 6px 11px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.05);
+    }
+    .previewPlaceholderBar{
+      width: 70%;
+      height: 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.06);
+      margin-bottom: 6px;
+    }
+    .previewHpBtn{
+      align-self:flex-start;
+      border-radius: 999px;
+      padding: 10px 18px;
+      font-size: 12px;
+      font-weight: 800;
+      border: none;
+      background: linear-gradient(135deg, rgba(248,250,252,.95), rgba(200,210,255,.85));
+      color: #111;
+      cursor:pointer;
+      transition: background .14s, border-color .14s;
+    }
+    .previewHpBtn:hover{ background: rgba(248,250,252,1); }
+    .specSection{
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.06);
+      background: rgba(255,255,255,.02);
+      padding: 16px;
+    }
+    .colorSwatchGrid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0,1fr));
+      gap: 10px;
+    }
+    @media (min-width: 800px){
+      .colorSwatchGrid{ grid-template-columns: repeat(3, minmax(0,1fr)); }
+    }
+    .colorSwatch{
+      width:100%;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.02);
+      display:flex;
+      align-items:center;
+      gap: 10px;
+      padding: 10px 12px;
+      cursor:pointer;
+      transition: background .14s, border-color .14s, color .14s;
+      color: rgba(255,255,255,.85);
+    }
+    .colorSwatch::before{
+      content:'';
+      width: 22px; height: 22px;
+      border-radius: 999px;
+      background: var(--swatch-color,#fff);
+      border: 1px solid rgba(255,255,255,.25);
+      box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      flex: 0 0 auto;
+    }
+    .colorSwatch[aria-selected="true"]{
+      background: var(--swatch-color, rgba(255,255,255,.18));
+      border-color: rgba(255,255,255,.4);
+      color: var(--swatch-ink, #111);
+      box-shadow: 0 18px 45px rgba(0,0,0,.25);
+    }
+    .colorSwatchMeta{ display:flex; flex-direction:column; align-items:flex-start; }
+    .colorName{ font-size: 13px; font-weight: 700; }
+    .colorHint{ font-size: 11px; opacity: .75; }
+    .hpPlanSummary{
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.03);
+      padding: 12px;
+      font-size: 13px;
+      color: rgba(255,255,255,.82);
+      line-height: 1.4;
+    }
+    .hpPlanTable{
+      width:100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      font-size: 12px;
+    }
+    .hpPlanTable th,
+    .hpPlanTable td{
+      text-align:left;
+      padding: 8px 6px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .hpPlanTable th{
+      font-size: 11px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.6);
+    }
+    .hpPlanNote{
+      margin-top: 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,.7);
+      line-height: 1.4;
+    }
+    .calendarWidget{
+      margin-top: 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(10,13,21,.65);
+      padding: 12px;
+    }
+    .calendarHeader{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    .calendarHeader button{
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.04);
+      color: rgba(255,255,255,.85);
+      border-radius: 10px;
+      width:32px;
+      height:32px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      cursor:pointer;
+      transition: background .14s, border-color .14s;
+    }
+    .calendarHeader button:hover{
+      border-color: rgba(255,255,255,.25);
+      background: rgba(255,255,255,.08);
+    }
+    .calendarDays{
+      display:grid;
+      grid-template-columns: repeat(7, minmax(0,1fr));
+      gap: 6px;
+      margin-top: 12px;
+      font-size: 10px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,.6);
+      letter-spacing: .18em;
+      text-align:center;
+    }
+    .calendarGrid{
+      display:grid;
+      grid-template-columns: repeat(7, minmax(0,1fr));
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .calendarCell{
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.08);
+      min-height: 38px;
+      background: rgba(255,255,255,.03);
+      color: rgba(255,255,255,.82);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size: 13px;
+      cursor:pointer;
+      transition: background .14s, border-color .14s, transform .08s;
+    }
+    .calendarCell[disabled]{
+      opacity: .2;
+      cursor: default;
+    }
+    .calendarCell[aria-selected="true"]{
+      background: rgba(59,130,246,.22);
+      border-color: rgba(59,130,246,.55);
+      color: #fff;
+      box-shadow: 0 10px 26px rgba(15,118,243,.28);
+    }
+    .calendarCell:not([disabled]):hover{
+      border-color: rgba(255,255,255,.22);
+      background: rgba(255,255,255,.08);
+    }
 
     .field{
       width:100%;
@@ -930,35 +1352,67 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       position: relative;
       display:flex;
       align-items:center;
-      gap: 10px;
-      padding: 12px 12px;
-      border-radius: 18px;
+      gap: 6px;
+      padding: 7px 10px;
+      border-radius: 12px;
       border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.035);
+      background: rgba(255,255,255,.028);
+      --pill-selected-bg: rgba(255,255,255,.11);
       cursor:pointer;
       user-select:none;
-      min-height: 54px;
-      transition: transform .08s, border-color .14s, background .14s, filter .14s;
+      min-height: 32px;
+      transition: transform .08s, border-color .14s, background .14s, filter .14s, box-shadow .18s;
       overflow:hidden;
     }
-    .pill:hover{ border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.055); }
+    .pill:hover{ border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.05); }
     .pill:active{ transform: translateY(1px); }
     .pill[aria-selected="true"]{
-      border-color: rgba(255,255,255,.38);
-      background: rgba(255,255,255,.11);
+      border-color: rgba(0,0,0,.16);
+      background: var(--pill-selected-bg);
+      box-shadow: 0 12px 26px rgba(0,0,0,.32);
     }
     .pill .ic{
-      width: 34px; height: 34px;
-      border-radius: 14px;
+      width: 22px; height: 22px;
+      border-radius: 9px;
       display:flex; align-items:center; justify-content:center;
       border: 1px solid rgba(255,255,255,.14);
+      background: var(--pill-accent, rgba(255,255,255,.08));
+      color: rgba(7,12,22,.85);
       overflow:hidden;
       flex: 0 0 auto;
-      box-shadow: 0 18px 55px rgba(0,0,0,.26);
+      box-shadow: 0 8px 18px rgba(0,0,0,.25);
+    }
+    .pill .ic svg{
+      width: 11px;
+      height: 11px;
+      stroke: currentColor;
     }
     .pill .tx{ min-width:0; }
-    .pill .tx .t{ font-size: 13px; font-weight: 800; color: rgba(255,255,255,.92); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .pill .tx .s{ font-size: 11px; color: rgba(255,255,255,.62); margin-top: 1px; }
+    .pill .tx .t{
+      font-size: 11px;
+      font-weight: 800;
+      color: rgba(255,255,255,.9);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .pill .tx .s{
+      font-size: 9px;
+      color: rgba(255,255,255,.62);
+      margin-top: 1px;
+    }
+    .pill[aria-selected="true"] .tx .t{
+      color: var(--pill-selected-ink, #0f172a);
+    }
+    .pill[aria-selected="true"] .tx .s{
+      color: var(--pill-selected-sub, rgba(15,23,42,.6));
+    }
+    .pill[aria-selected="true"] .ic{
+      background: rgba(255,255,255,.18);
+      color: var(--pill-selected-ink, #0f172a);
+      border-color: rgba(0,0,0,.14);
+      box-shadow: none;
+    }
 
     /* “Muted but colored when active”: keep pastel visible, but dim when not selected */
     .pill[data-pastel]{ filter: saturate(.90) brightness(.92); }
@@ -1067,9 +1521,9 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         </div>
 
         <div class="ml-auto hidden lg:flex items-center gap-2">
-          <button class="btn btnGhost" type="button" id="btnReset">Reset</button>
-          <button class="btn" type="button" id="btnBackTop">Back</button>
-          <button class="btn btnSolid" type="button" id="btnNextTop">Next</button>
+          <button class="btn btnGhost" type="button" id="btnReset">Reset<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5 10a5 5 0 1 1 1.3 3.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+          <button class="btn" type="button" id="btnBackTop">Back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+          <button class="btn btnSolid" type="button" id="btnNextTop">Next<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
         </div>
       </div>
     </div>
@@ -1081,7 +1535,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       <section class="card panelPad">
         <div class="progressWrap">
           <div class="bar"><i id="barFill"></i></div>
-          <div class="stepChip" id="stepChip">Step 1/12</div>
+          <div class="stepChip" id="stepChip">Step 1/18</div>
         </div>
 
         <div class="mt-5 hr"></div>
@@ -1095,79 +1549,52 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           </div>
 
           <div class="mt-6 flex items-center justify-between gap-3 hidden lg:flex" id="deskNav">
-            <button class="btn btnGhost" type="button" id="btnBack">Back</button>
+            <button class="btn btnGhost" type="button" id="btnBack">Back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
             <div class="flex items-center gap-2">
-              <button class="btn btnGhost" type="button" id="btnSkip">Skip</button>
-              <button class="btn btnSolid" type="button" id="btnNext">Next</button>
+              <button class="btn btnGhost" type="button" id="btnSkip">Skip<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M7 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+              <button class="btn btnSolid" type="button" id="btnNext">Next<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- SIDE SUMMARY -->
-      <aside class="card panelPad">
-        <div class="text-[13px] font-extrabold">Live summary</div>
-        <div class="qSub mt-2">What you have selected so far.</div>
-
-        <div class="mt-4 space-y-3 text-[13px]">
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Dealer</div>
-            <div class="text-white/90 font-semibold text-right" id="sumDealer">—</div>
+      <!-- SIDE PREVIEW -->
+      <aside>
+        <div class="previewCard" id="previewCard">
+          <div class="previewMedia" id="previewMedia">
+            <div class="previewMediaHint" id="previewMediaHint">Add photos to preview slider</div>
+            <div class="previewSliderWrap">
+            <button type="button" class="sliderCaret" id="sliderPrev" aria-label="Previous photo">
+              <svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="previewSliderDots" id="previewSliderDots"></div>
+            <div class="previewSliderMeta" id="previewSliderMeta">0 photos</div>
+            <button type="button" class="sliderCaret" id="sliderNext" aria-label="Next photo">
+              <svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
           </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Yard</div>
-            <div class="text-white/90 font-semibold text-right" id="sumYard">—</div>
           </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Make / Model</div>
-            <div class="text-white/90 font-semibold text-right" id="sumCar">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Year / Body</div>
-            <div class="text-white/90 font-semibold text-right" id="sumYearBody">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Town</div>
-            <div class="text-white/90 font-semibold text-right" id="sumTown">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Price</div>
-            <div class="text-white/90 font-semibold text-right" id="sumPrice">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Engine / Mileage</div>
-            <div class="text-white/90 font-semibold text-right" id="sumEngineMileage">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Fuel / Trans</div>
-            <div class="text-white/90 font-semibold text-right" id="sumFuelTrans">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Color</div>
-            <div class="text-white/90 font-semibold text-right" id="sumColor">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Sale Methods</div>
-            <div class="text-white/90 font-semibold text-right" id="sumSale">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Features</div>
-            <div class="text-white/90 font-semibold text-right" id="sumFeatures">—</div>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-white/60">Photos</div>
-            <div class="text-white/90 font-semibold text-right" id="sumPhotos">0</div>
+          <div class="previewBody">
+            <div class="previewHeader">
+              <div>
+                <div class="previewTitle" id="previewTitle">Add a vehicle</div>
+                <div class="previewMeta" id="previewMeta">Year • Body • Town</div>
+              </div>
+              <div class="previewPrice" id="previewPrice">KES —</div>
+            </div>
+            <div class="previewDealer" id="previewDealer">Select dealer to start</div>
+            <div class="previewSpecChips" id="previewSpecChips"></div>
+            <div class="previewFeatureChips" id="previewFeatureChips"></div>
+            <div class="previewSale" id="previewSale"></div>
           </div>
         </div>
 
-        <div class="mt-5 hr"></div>
-
-        <div class="mt-5">
+        <div class="card panelPad mt-5">
           <div class="text-[13px] font-extrabold">Fast actions</div>
           <div class="qSub mt-2">Use only when needed.</div>
           <div class="mt-3 flex flex-wrap gap-2">
-            <button class="btn btnGhost" type="button" id="btnReview">Review</button>
-            <button class="btn btnDanger" type="button" id="btnClearAll">Clear all</button>
+            <button class="btn btnGhost" type="button" id="btnReview">Review<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3 10s3.5-5 7-5 7 5 7 5-3.5 5-7 5-7-5-7-5Z" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+            <button class="btn btnDanger" type="button" id="btnClearAll">Clear all<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
           </div>
         </div>
       </aside>
@@ -1177,8 +1604,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
   <!-- Mobile nav -->
   <div class="mobileNav">
     <div class="mobileNavInner">
-      <button class="btn btnGhost" type="button" id="mBack" style="flex:1;">Back</button>
-      <button class="btn btnSolid" type="button" id="mNext" style="flex:2;">Next</button>
+      <button class="btn btnGhost" type="button" id="mBack" style="flex:1;">Back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+      <button class="btn btnSolid" type="button" id="mNext" style="flex:2;">Next<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
     </div>
   </div>
 
@@ -1210,6 +1637,9 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
   <script>
     const $ = (id) => document.getElementById(id);
     const API_BASE = window.location.pathname;
+    const PUBLISH_CANCELLED = 'PUBLISH_CANCELLED';
+    const ICON_ARROW_RIGHT = '<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
+    const ICON_ARROW_LEFT = '<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
 
     /* ---------- Toast ---------- */
     function toast(title, sub){
@@ -1262,49 +1692,118 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       const lit = 55 + (h % 12);  // 55..66
       return `hsl(${hue} ${sat}% ${lit}%)`;
     }
+    const namedColorHex = {
+      'white':'#f7f7f7',
+      'black':'#0b0b0b',
+      'silver':'#c0c0c0',
+      'grey':'#7a7a7a',
+      'gray':'#7a7a7a',
+      'blue':'#1d4ed8',
+      'red':'#dc2626',
+      'green':'#15803d',
+      'beige':'#d6c7a1',
+      'brown':'#8b5a2b',
+      'gold':'#d4af37',
+      'orange':'#f97316',
+      'purple':'#7c3aed'
+    };
+    function colorValueFromName(name){
+      if (!name) return pastelFromKey('color');
+      const key = name.trim().toLowerCase();
+      return namedColorHex[key] || pastelFromKey(key);
+    }
+    function isLightColor(color){
+      if (!color) return false;
+      if (color.startsWith('#')){
+        let hex = color.replace('#','');
+        if (hex.length === 3){
+          hex = hex.split('').map(ch=>ch+ch).join('');
+        }
+        const r = parseInt(hex.slice(0,2), 16);
+        const g = parseInt(hex.slice(2,4), 16);
+        const b = parseInt(hex.slice(4,6), 16);
+        const lum = (0.299*r + 0.587*g + 0.114*b) / 255;
+        return lum > 0.6;
+      }
+      const match = color.match(/hsl\(\s*\d+\s+(\d+)%\s+(\d+)%\s*\)/i);
+      if (match){
+        const lightness = parseInt(match[2], 10);
+        return lightness >= 60;
+      }
+      return false;
+    }
+    function niceLabel(str){
+      if (!str) return '';
+      return String(str).split(/[_\s]+/).map(part=>{
+        if (!part) return '';
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+      }).join(' ');
+    }
+    function autoTitle(){
+      const manual = (state.title || '').trim();
+      if (manual) return manual;
+      const parts = [];
+      if (state.year) parts.push(state.year);
+      if (state.make && state.make.name) parts.push(state.make.name);
+      if (state.model && state.model.name) parts.push(state.model.name);
+      if (state.body) parts.push(state.body);
+      return parts.length ? parts.join(' ') : 'Add a vehicle';
+    }
+    function setPreviewText(elId, value, placeholder){
+      const el = $(elId);
+      if (!el) return;
+      if (!value || !String(value).trim()){
+        el.classList.add('placeholder');
+        el.textContent = placeholder;
+      } else {
+        el.classList.remove('placeholder');
+        el.textContent = value;
+      }
+    }
     function duotoneIcon(kind){
       // Simple duotone-ish icons: two paths with different opacities.
       // kind: car, pin, tag, bolt, gear, fuel, trans, palette, money, camera, shield
-      const common = 'fill="none" stroke="rgba(0,0,0,.92)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"';
+      const common = 'fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"';
+      const sizeAttr = 'width="14" height="14" viewBox="0 0 24 24"';
       switch(kind){
         case 'pin': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M12 21s7-4.6 7-11a7 7 0 1 0-14 0c0 6.4 7 11 7 11Z"/>
             <path ${common} opacity=".55" d="M12 10a2.3 2.3 0 1 0 0 .1Z"/>
           </svg>`;
         case 'tag': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M20 13l-7 7-11-11V2h7l11 11Z"/>
             <path ${common} opacity=".55" d="M7.5 7.5h.01"/>
           </svg>`;
         case 'money': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M3 7h18v10H3z"/>
             <path ${common} opacity=".55" d="M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/>
           </svg>`;
         case 'fuel': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M6 3h8v18H6z"/>
             <path ${common} opacity=".55" d="M14 8h2l2 2v10a2 2 0 0 1-2 2h-2"/>
           </svg>`;
         case 'trans': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M7 7h10M12 7v10"/>
             <path ${common} opacity=".55" d="M9 17h6"/>
           </svg>`;
         case 'palette': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 2-2c0-1.2-.8-2-2-2h-1"/>
             <path ${common} opacity=".55" d="M7.5 10h.01M10 8h.01M14 8h.01M16.5 10h.01"/>
           </svg>`;
         case 'camera': return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M4 7h4l2-2h4l2 2h4v12H4z"/>
             <path ${common} opacity=".55" d="M12 10a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/>
           </svg>`;
         case 'car':
         default: return `
-          <svg width="18" height="18" viewBox="0 0 24 24">
+          <svg ${sizeAttr}>
             <path ${common} d="M3 13.5v3.2c0 .7.6 1.3 1.3 1.3H6"/>
             <path ${common} d="M18 18h1.7c.7 0 1.3-.6 1.3-1.3v-3.2c0-1-.6-1.9-1.5-2.3l-1.8-.8-1.6-3.9C15.7 5.6 14.9 5 14 5H10c-.9 0-1.7.6-2 1.5L6.4 10.4l-1.8.8C3.6 11.6 3 12.5 3 13.5Z"/>
             <path ${common} opacity=".55" d="M7 18a2 2 0 1 0 4 0M13 18a2 2 0 1 0 4 0"/>
@@ -1313,6 +1812,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
     function pillEl({id, title, sub, kind, key, selected=false}){
       const bg = pastelFromKey(key || title || id);
+      const ink = isLightColor(bg) ? '#0f172a' : '#f8fafc';
+      const sub = isLightColor(bg) ? 'rgba(15,23,42,.62)' : 'rgba(255,255,255,.75)';
       const el = document.createElement('div');
       el.className = 'pill';
       el.setAttribute('role','button');
@@ -1322,9 +1823,13 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       el.dataset.title = String(title ?? '');
       el.dataset.key = String(key || title || id || '');
       el.dataset.pastel = '1';
+      el.style.setProperty('--pill-selected-bg', bg);
+      el.style.setProperty('--pill-selected-ink', ink);
+      el.style.setProperty('--pill-selected-sub', sub);
+      el.style.setProperty('--pill-accent', bg);
 
       el.innerHTML = `
-        <div class="ic" style="background:${bg};">
+        <div class="ic">
           <div style="opacity:.92">${duotoneIcon(kind || 'car')}</div>
         </div>
         <div class="tx">
@@ -1351,6 +1856,225 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     function closeModal(){ $('modal').style.display = 'none'; }
     $('modalClose').addEventListener('click', closeModal);
     $('modal').addEventListener('click', (e)=>{ if (e.target === $('modal')) closeModal(); });
+
+    function confirmDealerPublish(dealerName){
+      return new Promise((resolve, reject)=>{
+        const name = dealerName || 'this dealer';
+        openModal("Confirm dealer", "Just a quick check before publishing.", `
+          <div class="selectedCard" style="margin-bottom:12px;">
+            <div class="scLabel">Dealer</div>
+            <div class="scValue">${escapeHtml(name)}</div>
+            <div class="scSub">Confirm this is the intended account.</div>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <button class="btn btnGhost" type="button" id="confirmDealerNo">Go back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+            <button class="btn btnSolid" type="button" id="confirmDealerYes">Publish for ${escapeHtml(name)}${ICON_ARROW_RIGHT}</button>
+          </div>
+        `);
+
+        const yesBtn = $('confirmDealerYes');
+        const noBtn = $('confirmDealerNo');
+        const overlay = $('modal');
+        const closeBtn = $('modalClose');
+
+        const cleanup = ()=>{
+          yesBtn && yesBtn.removeEventListener('click', onYes);
+          noBtn && noBtn.removeEventListener('click', onCancel);
+          overlay.removeEventListener('click', overlayHandler);
+          closeBtn.removeEventListener('click', closeHandler);
+        };
+
+        const onYes = ()=>{
+          cleanup();
+          closeModal();
+          resolve(true);
+        };
+        const onCancel = ()=>{
+          cleanup();
+          closeModal();
+          reject(new Error(PUBLISH_CANCELLED));
+        };
+        const overlayHandler = (e)=>{
+          if (e.target === overlay){
+            cleanup();
+            reject(new Error(PUBLISH_CANCELLED));
+          }
+        };
+        const closeHandler = ()=>{
+          cleanup();
+          reject(new Error(PUBLISH_CANCELLED));
+        };
+
+        yesBtn && yesBtn.addEventListener('click', onYes);
+        noBtn && noBtn.addEventListener('click', onCancel);
+        overlay.addEventListener('click', overlayHandler);
+        closeBtn.addEventListener('click', closeHandler);
+      });
+    }
+
+    function openHpScheduleModal(){
+      if (!state.sale.hp){
+        toast("Hire purchase disabled", "Enable HP in payment options first.");
+        return;
+      }
+      if (!state.price){
+        toast("Price required", "Add a cash price before previewing HP schedule.");
+        return;
+      }
+      const months = state.hp.months || 0;
+      if (!months){
+        toast("HP months missing", "Set HP months to preview the schedule.");
+        return;
+      }
+      const deposit = state.hp.deposit ? Number(state.hp.deposit) : 0;
+      const financed = Math.max((state.price || 0) - deposit, 0);
+      const safeMonths = Math.max(months, 1);
+      const monthly = safeMonths ? financed / safeMonths : financed;
+      const today = new Date();
+      const defaultDate = today.toISOString().split('T')[0];
+      const dealerName = state.dealer ? state.dealer.full_name : '—';
+      const yardName = state.yard ? state.yard.yard_name : '—';
+      openModal("Hire purchase plan", "Select a start date to preview the amortization summary.", `
+        <div>
+          <div class="label">Start date</div>
+          <input class="field mt-2" type="date" id="hpPlanStart" value="${defaultDate}">
+          <div class="calendarWidget" id="hpCalendar"></div>
+          <div class="hpPlanSummary mt-4" id="hpPlanSummary"></div>
+          <div class="hpPlanSummary mt-3">Dealer: <strong>${escapeHtml(dealerName)}</strong><br>Yard: <strong>${escapeHtml(yardName || '—')}</strong></div>
+          <table class="hpPlanTable">
+            <thead>
+              <tr><th>Stage</th><th>Due</th><th>Amount</th></tr>
+            </thead>
+            <tbody id="hpPlanTable"></tbody>
+          </table>
+          <div class="qSub mt-2">Assumes constant monthly payments for a simple preview.</div>
+          <div class="hpPlanNote">Planning figure only. Price may vary slightly due to extras like trackers (est. KES 4k–20k) and insurance (per policy).</div>
+        </div>
+      `);
+      const startInput = $('hpPlanStart');
+      const summary = $('hpPlanSummary');
+      const table = $('hpPlanTable');
+      const calendarEl = $('hpCalendar');
+      const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+      const dayNames = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+      let calendarCursor = startInput.value ? new Date(startInput.value) : new Date();
+      if (Number.isNaN(calendarCursor.getTime())) calendarCursor = new Date();
+      calendarCursor.setDate(1);
+
+      const addMonths = (date, monthsToAdd)=>{
+        const d = new Date(date.getTime());
+        d.setMonth(d.getMonth() + monthsToAdd);
+        return d;
+      };
+
+      const renderPlan = ()=>{
+        let start = startInput.value ? new Date(startInput.value) : new Date();
+        if (Number.isNaN(start.getTime())) start = new Date();
+        const endDate = addMonths(start, safeMonths);
+        summary.innerHTML = `
+          Pay a deposit of <strong>${formatKesSafe(deposit, 'KES 0')}</strong>, finance <strong>${formatKesSafe(financed, 'KES 0')}</strong>
+          over <strong>${safeMonths} month${safeMonths === 1 ? '' : 's'}</strong> at roughly <strong>${formatKesSafe(Math.round(monthly), 'KES 0')}</strong> per month.
+          Estimated completion: <strong>${endDate.toLocaleDateString()}</strong>.
+        `;
+        const rows = [];
+        rows.push(`
+          <tr>
+            <td>Deposit</td>
+            <td>${start.toLocaleDateString()}</td>
+            <td>${formatKesSafe(deposit, 'KES 0')}</td>
+          </tr>
+        `);
+        const monthsToShow = Math.min(safeMonths, 6);
+        for (let i=1; i<=monthsToShow; i++){
+          const due = addMonths(start, i);
+          rows.push(`
+            <tr>
+              <td>M${i}</td>
+              <td>${due.toLocaleDateString()}</td>
+              <td>${formatKesSafe(Math.round(monthly), 'KES 0')}</td>
+            </tr>
+          `);
+        }
+        if (safeMonths > monthsToShow){
+          rows.push(`<tr><td colspan="3">… ${safeMonths - monthsToShow} more payment${safeMonths - monthsToShow === 1 ? '' : 's'}</td></tr>`);
+        }
+        rows.push(`
+          <tr>
+            <td>Completion</td>
+            <td>${endDate.toLocaleDateString()}</td>
+            <td>${formatKesSafe(Math.round(monthly), 'KES 0')}</td>
+          </tr>
+        `);
+        table.innerHTML = rows.join('');
+      };
+
+      const renderCalendar = ()=>{
+        if (!calendarEl) return;
+        const view = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth(), 1);
+        const selectedRaw = startInput.value ? new Date(startInput.value) : null;
+        calendarEl.innerHTML = `
+          <div class="calendarHeader">
+            <button type="button" id="calPrev">&lsaquo;</button>
+            <div>${monthNames[view.getMonth()]} ${view.getFullYear()}</div>
+            <button type="button" id="calNext">&rsaquo;</button>
+          </div>
+          <div class="calendarDays">${dayNames.map(d=>`<span>${d}</span>`).join('')}</div>
+          <div class="calendarGrid"></div>
+        `;
+        const grid = calendarEl.querySelector('.calendarGrid');
+        if (!grid) return;
+        const firstDay = (view.getDay() + 6) % 7; // Monday-first
+        for (let i=0; i<firstDay; i++){
+          const pad = document.createElement('div');
+          pad.className = 'calendarCell';
+          pad.setAttribute('disabled','true');
+          grid.appendChild(pad);
+        }
+        const daysInMonth = new Date(view.getFullYear(), view.getMonth()+1, 0).getDate();
+        for (let d=1; d<=daysInMonth; d++){
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'calendarCell';
+          btn.textContent = String(d);
+          const cellDate = new Date(view.getFullYear(), view.getMonth(), d);
+          const selected = selectedRaw && !Number.isNaN(selectedRaw.getTime()) &&
+            selectedRaw.getFullYear() === cellDate.getFullYear() &&
+            selectedRaw.getMonth() === cellDate.getMonth() &&
+            selectedRaw.getDate() === cellDate.getDate();
+          btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+          btn.addEventListener('click', ()=>{
+            startInput.value = cellDate.toISOString().split('T')[0];
+            renderPlan();
+            calendarCursor = new Date(cellDate.getFullYear(), cellDate.getMonth(), 1);
+            renderCalendar();
+          });
+          grid.appendChild(btn);
+        }
+        $('calPrev')?.addEventListener('click', ()=>{
+          calendarCursor.setMonth(calendarCursor.getMonth() - 1);
+          renderCalendar();
+        });
+        $('calNext')?.addEventListener('click', ()=>{
+          calendarCursor.setMonth(calendarCursor.getMonth() + 1);
+          renderCalendar();
+        });
+      };
+
+      const handleStartChange = ()=>{
+        renderPlan();
+        if (startInput.value){
+          const cur = new Date(startInput.value);
+          if (!Number.isNaN(cur.getTime())){
+            calendarCursor = new Date(cur.getFullYear(), cur.getMonth(), 1);
+          }
+        }
+        renderCalendar();
+      };
+
+      startInput.addEventListener('change', handleStartChange);
+      renderPlan();
+      renderCalendar();
+    }
 
     /* ---------- Wizard State ---------- */
     const state = {
@@ -1387,23 +2111,20 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       },
 
       hp: {
-        minDeposit: null,
-        maxDeposit: null,
-        minMonths: 3,
-        maxMonths: 60,
+        deposit: null,
+        months: 12,
         notes: ''
       },
 
       selectedFeatures: [],
 
       photos: [], // {file,url}
-      expiryDays: 30,
-      sponsorDays: 0,
 
       title: '',
       trim: '',
       description: ''
     };
+    let previewSlideIndex = 0;
 
     const steps = [
       "dealer",
@@ -1414,7 +2135,12 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       "body",
       "town",
       "pricing",
-      "specs",
+      "engine",
+      "fuel",
+      "trans",
+      "color",
+      "extras",
+      "condition",
       "sale",
       "features",
       "photos",
@@ -1440,28 +2166,238 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
 
     /* ---------- Summary ---------- */
+    function formatKesSafe(val, fallback='KES —'){
+      if (val === null || val === undefined || val === '') return fallback;
+      return 'KES ' + Number(val).toLocaleString();
+    }
+    function formatNumberUnit(val, unit=''){
+      if (val === null || val === undefined || val === '') return null;
+      return `${Number(val).toLocaleString()}${unit}`;
+    }
     function updateSummary(){
-      $('sumDealer').textContent = state.dealer ? state.dealer.full_name : '—';
-      $('sumYard').textContent = state.yard ? state.yard.yard_name : '—';
-      $('sumCar').textContent = (state.make && state.model) ? `${state.make.name} ${state.model.name}` : '—';
-      $('sumYearBody').textContent = (state.year || state.body) ? `${state.year || '—'} / ${state.body || '—'}` : '—';
-      $('sumTown').textContent = state.town ? state.town.name : '—';
-      $('sumPrice').textContent = state.price ? `KES ${Number(state.price).toLocaleString()}` : '—';
-      const eng = state.engine ? `${state.engine}cc` : '—';
-      const mil = (state.mileage !== null && state.mileage !== undefined && state.mileage !== '') ? `${Number(state.mileage).toLocaleString()}km` : '—';
-      $('sumEngineMileage').textContent = `${eng} / ${mil}`;
-      $('sumFuelTrans').textContent = `${state.fuel || '—'} / ${state.trans || '—'}`;
-      $('sumColor').textContent = state.color || '—';
+      const card = $('previewCard');
+      if (!card) return;
+      const title = autoTitle();
+      setPreviewText('previewTitle', title !== 'Add a vehicle' ? title : '', 'Add a vehicle');
+      const metaParts = [];
+      if (state.year) metaParts.push(state.year);
+      if (state.body) metaParts.push(state.body);
+      if (state.town) metaParts.push(state.town.name);
+      setPreviewText('previewMeta', metaParts.join(' • '), 'Year • Body • Town');
+      setPreviewText('previewPrice', state.price ? formatKesSafe(state.price) : '', 'Price pending');
+      const dealerLine = state.dealer
+        ? `${state.dealer.full_name}${state.yard ? ' • ' + state.yard.yard_name : ''}`
+        : '';
+      setPreviewText('previewDealer', dealerLine, 'Select dealer to start');
+      updatePreviewMedia();
+      renderSpecChips();
+      renderFeatureChips();
+      renderSaleBlock();
+      const autoTitleNode = $('autoTitlePreview');
+      if (autoTitleNode) autoTitleNode.textContent = autoTitle();
+    }
 
-      const sale = [];
-      if (state.sale.cash) sale.push('Cash');
-      if (state.sale.hp) sale.push('HP');
-      if (state.sale.trade) sale.push('Trade');
-      if (state.sale.external) sale.push('External');
-      $('sumSale').textContent = sale.length ? sale.join(', ') : '—';
+    function updatePreviewMedia(){
+      const media = $('previewMedia');
+      const hint = $('previewMediaHint');
+      const dots = $('previewSliderDots');
+      const sliderMeta = $('previewSliderMeta');
+      const prevBtn = $('sliderPrev');
+      const nextBtn = $('sliderNext');
+      if (!media || !dots || !sliderMeta) return;
+      const count = state.photos.length;
+      const sliderInk = window.getComputedStyle(sliderMeta).color;
+      const caretInk = (sliderInk && sliderInk.trim()) ? sliderInk : '#f8fafc';
+      [prevBtn, nextBtn].forEach(btn=>{
+        if (!btn) return;
+        btn.style.color = caretInk;
+      });
+      sliderMeta.textContent = `${count} photo${count === 1 ? '' : 's'}`;
+      dots.innerHTML = '';
+      if (count && previewSlideIndex >= count) previewSlideIndex = 0;
+      const dotCount = count || 3;
+      const maxDots = Math.min(dotCount, 6);
+      for (let i=0; i<maxDots; i++){
+        const dot = document.createElement('span');
+        dot.className = 'previewDot';
+        if (count){
+          if (i === previewSlideIndex) dot.classList.add('active');
+        } else if (i === 0){
+          dot.classList.add('active');
+        }
+        dots.appendChild(dot);
+      }
+      if (prevBtn){
+        prevBtn.disabled = count <= 1;
+        prevBtn.onclick = ()=> changePreviewSlide(-1);
+      }
+      if (nextBtn){
+        nextBtn.disabled = count <= 1;
+        nextBtn.onclick = ()=> changePreviewSlide(1);
+      }
+      if (count){
+        const photo = state.photos[previewSlideIndex] || state.photos[0];
+        media.style.backgroundImage = `url(${photo.url})`;
+        media.classList.add('has-photo');
+        if (hint) hint.textContent = '';
+      } else {
+        media.style.backgroundImage = '';
+        media.classList.remove('has-photo');
+        if (hint) hint.textContent = 'Add photos to preview slider';
+      }
+    }
 
-      $('sumFeatures').textContent = state.selectedFeatures.length ? `${state.selectedFeatures.length} selected` : '—';
-      $('sumPhotos').textContent = String(state.photos.length);
+    function renderSpecChips(){
+      const wrap = $('previewSpecChips');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      const chips = [];
+      if (state.engine) chips.push({label:'Engine', value:`${state.engine}cc`, icon:'gear'});
+      const mileageVal = formatNumberUnit(state.mileage, 'km');
+      if (mileageVal) chips.push({label:'Mileage', value:mileageVal, icon:'bolt'});
+      if (state.fuel) chips.push({label:'Fuel', value:niceLabel(state.fuel), icon:'fuel'});
+      if (state.trans) chips.push({label:'Trans', value:niceLabel(state.trans), icon:'trans'});
+      if (state.color){
+        chips.push({label:'Color', value:state.color, icon:'palette', colorValue: colorValueFromName(state.color)});
+      }
+      if (state.condition){
+        chips.push({label:'Condition', value:niceLabel(state.condition), icon:'shield'});
+      }
+      if (!chips.length){
+        [70, 45].forEach(w=>{
+          const bar = document.createElement('div');
+          bar.className = 'previewPlaceholderBar';
+          bar.style.width = w + '%';
+          wrap.appendChild(bar);
+        });
+        return;
+      }
+      chips.forEach(ch=>{
+        const chip = document.createElement('div');
+        chip.className = 'previewChip';
+        const bg = ch.colorValue || pastelFromKey((ch.label || '') + (ch.value || ''));
+        const ink = isLightColor(bg) ? '#0f172a' : '#f8fafc';
+        chip.classList.add('colorful');
+        chip.style.setProperty('--chip-color', bg);
+        chip.style.setProperty('--chip-ink', ink);
+        const icon = document.createElement('span');
+        icon.className = 'chipIcon';
+        icon.innerHTML = duotoneIcon(ch.icon || 'car');
+        const label = document.createElement('span');
+        label.className = 'chipLabel';
+        label.textContent = ch.label;
+        const val = document.createElement('span');
+        val.textContent = ch.value;
+        chip.appendChild(icon);
+        chip.appendChild(label);
+        chip.appendChild(val);
+        wrap.appendChild(chip);
+      });
+    }
+
+    function renderFeatureChips(){
+      const wrap = $('previewFeatureChips');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      const selected = state.selectedFeatures || [];
+      if (!selected.length){
+        [60, 35].forEach(w=>{
+          const bar = document.createElement('div');
+          bar.className = 'previewPlaceholderBar';
+          bar.style.width = w + '%';
+          wrap.appendChild(bar);
+        });
+        return;
+      }
+      const labelMap = {};
+      (state.features || []).forEach(f=>{ labelMap[f.tag] = f.label || f.tag; });
+      selected.slice(0,4).forEach(tag=>{
+        const chip = document.createElement('div');
+        chip.className = 'previewChip';
+        const text = labelMap[tag] || tag;
+        const bg = pastelFromKey(text);
+        const ink = isLightColor(bg) ? '#0f172a' : '#f8fafc';
+        chip.classList.add('colorful');
+        chip.style.setProperty('--chip-color', bg);
+        chip.style.setProperty('--chip-ink', ink);
+        chip.textContent = text;
+        wrap.appendChild(chip);
+      });
+      if (selected.length > 4){
+        const more = document.createElement('div');
+        more.className = 'previewChip';
+        more.textContent = `+${selected.length - 4} more`;
+        wrap.appendChild(more);
+      }
+    }
+
+    function renderSaleBlock(){
+      const wrap = $('previewSale');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      const title = document.createElement('div');
+      title.className = 'previewSaleTitle';
+      title.textContent = 'Payment options';
+      wrap.appendChild(title);
+
+      const badges = document.createElement('div');
+      badges.className = 'previewSaleBadges';
+      const saleOpts = [
+        {key:'cash', label:'Cash'},
+        {key:'hp', label:'Hire purchase'},
+        {key:'trade', label:'Trade-in'},
+        {key:'external', label:'External finance'}
+      ];
+      let hasSale = false;
+      saleOpts.forEach(opt=>{
+        if (state.sale[opt.key]){
+          hasSale = true;
+          const badge = document.createElement('div');
+          badge.className = 'previewSaleBadge';
+          badge.textContent = opt.label;
+          badges.appendChild(badge);
+        }
+      });
+      if (hasSale){
+        wrap.appendChild(badges);
+      } else {
+        [65, 40].forEach(w=>{
+          const bar = document.createElement('div');
+          bar.className = 'previewPlaceholderBar';
+          bar.style.width = w + '%';
+          wrap.appendChild(bar);
+        });
+      }
+
+      if (state.sale.hp){
+        const summary = document.createElement('div');
+        summary.className = 'hpPlanSummary';
+        summary.innerHTML = `<div>${hpSummaryText()}</div>${hpMonthlyAmount() ? `<div class="mt-1 text-[12px] opacity-80">Approx. ${formatKesSafe(hpMonthlyAmount(), 'KES 0')}/month after deposit.</div>`:''}`;
+        wrap.appendChild(summary);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'previewHpBtn';
+        btn.innerHTML = `View HP schedule${ICON_ARROW_RIGHT}`;
+        btn.addEventListener('click', openHpScheduleModal);
+        wrap.appendChild(btn);
+      }
+    }
+
+    function hpMonthlyAmount(){
+      if (!state.sale.hp) return null;
+      if (!state.price || !state.hp.months) return null;
+      const deposit = state.hp.deposit ? Number(state.hp.deposit) : 0;
+      const financed = Math.max(Number(state.price) - deposit, 0);
+      if (!financed || !state.hp.months) return null;
+      return Math.round(financed / state.hp.months);
+    }
+    function hpSummaryText(){
+      const deposit = state.hp.deposit ? formatKesSafe(state.hp.deposit) : 'Deposit TBD';
+      const months = state.hp.months || 0;
+      const tenor = months ? `${months} month${months === 1 ? '' : 's'}` : 'Tenor TBD';
+      const monthly = hpMonthlyAmount();
+      const monthlyText = monthly ? ` • ${formatKesSafe(monthly)}/mo` : '';
+      return `${deposit} • ${tenor}${monthlyText}`;
     }
 
     /* ---------- Data loads ---------- */
@@ -1513,20 +2449,42 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       box.innerHTML = `
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <div class="label">Dealer phone (E.164)</div>
-            <input class="field mt-2" id="dealerPhone" placeholder="+2547xxxxxxxx" autocomplete="off">
+            <div class="label">Dealer phone (07 / 01 / +254)</div>
+            <input class="field mt-2" id="dealerPhone" placeholder="0712 000 000 or +254 712..." autocomplete="off">
           </div>
           <div>
-            <div class="label">Dealer name (optional, only if creating)</div>
+            <div class="label">Dealer Name</div>
             <input class="field mt-2" id="dealerName" placeholder="Optional" autocomplete="off">
           </div>
         </div>
-        <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
-          <div class="qSub">Status: <span class="text-white/85 font-extrabold" id="dealerStatus">${state.dealer ? escapeHtml(state.dealer.full_name) : 'Not selected'}</span></div>
-          <button class="btn btnSolid" type="button" id="btnDealerLookup">Lookup / Create</button>
+        <div class="mt-4 flex flex-wrap items-start justify-between gap-3">
+          <div class="selectedCard" id="dealerCard" style="${state.dealer ? '' : 'display:none;'}"></div>
+          <div class="flex flex-wrap items-center justify-end gap-3" style="flex:1; min-width:220px;">
+            <div class="qSub">Status: <span class="text-white/85 font-extrabold" id="dealerStatus">${state.dealer ? escapeHtml(state.dealer.full_name) : 'Not selected'}</span></div>
+          <button class="btn btnSolid" type="button" id="btnDealerLookup">Lookup / Create<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3 10a7 7 0 1 1 2 5l-2 3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+          </div>
         </div>
       `;
       setBodyNode(box);
+
+      $('dealerPhone').value = state.dealer ? (state.dealer.phone_e164 || '') : '';
+
+      const renderDealerCard = ()=>{
+        const card = $('dealerCard');
+        if (!card) return;
+        if (!state.dealer){
+          card.style.display = 'none';
+          card.innerHTML = '';
+          return;
+        }
+        card.style.display = 'flex';
+        card.innerHTML = `
+          <div class="scLabel">Dealer</div>
+          <div class="scValue">${escapeHtml(state.dealer.full_name)}</div>
+          <div class="scSub">${escapeHtml(state.dealer.phone_e164 || '')}</div>
+        `;
+      };
+      renderDealerCard();
 
       $('btnDealerLookup').addEventListener('click', async ()=>{
         try{
@@ -1536,6 +2494,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           const data = await apiPost('dealer_lookup', fd);
           state.dealer = data.dealer;
           $('dealerStatus').textContent = state.dealer.full_name;
+          $('dealerPhone').value = state.dealer.phone_e164 || '';
+          renderDealerCard();
           toast(data.created ? "Dealer created" : "Dealer loaded", state.dealer.full_name);
           updateSummary();
           // auto advance
@@ -1552,31 +2512,53 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       const hint = document.createElement('div');
       hint.className = 'qSub';
-      hint.textContent = state.dealer ? `Dealer: ${state.dealer.full_name}` : 'Dealer not selected. Go back and select dealer.';
+      hint.innerHTML = state.dealer
+        ? `Serving dealer <span class="dealerAccent">${escapeHtml(state.dealer.full_name)}</span>`
+        : 'Dealer not selected. Go back and select dealer.';
       wrap.appendChild(hint);
 
-      const grid = document.createElement('div');
-      grid.className = 'mt-4';
+      const controlRow = document.createElement('div');
+      controlRow.className = 'mt-4 flex flex-wrap items-start justify-between gap-3';
 
-      const row = document.createElement('div');
-      row.className = 'flex flex-wrap gap-10px';
-      row.style.gap = '10px';
+      const card = document.createElement('div');
+      card.className = 'selectedCard';
+      card.id = 'yardCard';
+      controlRow.appendChild(card);
+
+      const controlButtons = document.createElement('div');
+      controlButtons.className = 'flex flex-wrap items-center gap-2';
+      const addBtn = document.createElement('button');
+      addBtn.className = 'btnAdd';
+      addBtn.type = 'button';
+      addBtn.innerHTML = `Add yard${ICON_ARROW_RIGHT}`;
+      controlButtons.appendChild(addBtn);
+      controlRow.appendChild(controlButtons);
+      wrap.appendChild(controlRow);
 
       const listWrap = document.createElement('div');
       listWrap.className = 'pillGrid';
       listWrap.id = 'yardPills';
-
-      const addBtn = document.createElement('button');
-      addBtn.className = 'btnAdd';
-      addBtn.type = 'button';
-      addBtn.textContent = '+ Add yard';
-
-      row.appendChild(addBtn);
-      wrap.appendChild(row);
-      wrap.appendChild(document.createElement('div')).className = 'mt-4';
+      listWrap.style.marginTop = '14px';
       wrap.appendChild(listWrap);
 
       setBodyNode(wrap);
+
+      const updateYardCard = ()=>{
+        const cardEl = $('yardCard');
+        if (!cardEl) return;
+        if (!state.yard){
+          cardEl.style.display = 'none';
+          cardEl.innerHTML = '';
+          return;
+        }
+        cardEl.style.display = 'flex';
+        cardEl.innerHTML = `
+          <div class="scLabel">Yard</div>
+          <div class="scValue">${escapeHtml(state.yard.yard_name)}</div>
+          <div class="scSub">${escapeHtml(state.yard.town_name || 'Dealer yard')}</div>
+        `;
+      };
+      updateYardCard();
 
       if (!state.dealer){
         toast("Missing dealer", "Go back to pick dealer first.");
@@ -1595,6 +2577,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             selectSingleInGrid(pillGrid, none);
             state.yard = null;
             updateSummary();
+            updateYardCard();
+            next();
           });
           pillGrid.appendChild(none);
 
@@ -1610,8 +2594,9 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             });
             p.addEventListener('click', ()=>{
               selectSingleInGrid(pillGrid, p);
-              state.yard = {id: y.id, yard_name: y.yard_name, town_id: y.town_id};
+              state.yard = {id: y.id, yard_name: y.yard_name, town_id: y.town_id, town_name: y.town_name};
               updateSummary();
+              updateYardCard();
               next();
             });
             pillGrid.appendChild(p);
@@ -1637,8 +2622,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             </select>
 
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveYard" type="button">Save yard</button>
-              <button class="btn btnGhost" id="mCancelYard" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveYard" type="button">Save yard${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelYard" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -1677,7 +2662,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       const top = document.createElement('div');
       top.className = 'flex items-center justify-between gap-2 flex-wrap';
       top.innerHTML = `
-        <button class="btnAdd" type="button" id="btnAddMake">+ Add make</button>
+        <button class="btnAdd" type="button" id="btnAddMake">Add make${ICON_ARROW_RIGHT}</button>
       `;
       wrap.appendChild(top);
 
@@ -1704,6 +2689,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddMake').addEventListener('click', ()=>{
         openModal("Add make", "Saved into vehicle_makes (Title Case).", `
@@ -1711,8 +2697,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label">Make name</div>
             <input class="field mt-2" id="mMakeName" placeholder="e.g. Toyota">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveMake" type="button">Save make</button>
-              <button class="btn btnGhost" id="mCancelMake" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveMake" type="button">Save make${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelMake" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -1751,7 +2737,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       const top = document.createElement('div');
       top.className = 'flex items-center justify-between gap-2 flex-wrap';
       top.innerHTML = `
-        <button class="btnAdd" type="button" id="btnAddModel">+ Add model</button>
+        <button class="btnAdd" type="button" id="btnAddModel">Add model${ICON_ARROW_RIGHT}</button>
       `;
       wrap.appendChild(top);
 
@@ -1778,6 +2764,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddModel').addEventListener('click', ()=>{
         openModal("Add model", `Saved into vehicle_models for ${state.make.name} (Title Case).`, `
@@ -1785,8 +2772,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label">Model name</div>
             <input class="field mt-2" id="mModelName" placeholder="e.g. Vitz">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveModel" type="button">Save model</button>
-              <button class="btn btnGhost" id="mCancelModel" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveModel" type="button">Save model${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelModel" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -1823,7 +2810,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       const top = document.createElement('div');
       top.className = 'flex items-center justify-between gap-2 flex-wrap';
-      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddYear">+ Add year</button>`;
+      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddYear">Add year${ICON_ARROW_RIGHT}</button>`;
       wrap.appendChild(top);
 
       const grid = document.createElement('div');
@@ -1848,6 +2835,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddYear').addEventListener('click', ()=>{
         openModal("Add year", "Saved into vehicle_model_years for this model.", `
@@ -1855,8 +2843,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label">Year</div>
             <input class="field mt-2" id="mYearVal" placeholder="e.g. 2014" inputmode="numeric">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveYear" type="button">Save year</button>
-              <button class="btn btnGhost" id="mCancelYear" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveYear" type="button">Save year${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelYear" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -1895,7 +2883,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       const top = document.createElement('div');
       top.className = 'flex items-center justify-between gap-2 flex-wrap';
-      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddBody">+ Add body type</button>`;
+      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddBody">Add body type${ICON_ARROW_RIGHT}</button>`;
       wrap.appendChild(top);
 
       const grid = document.createElement('div');
@@ -1918,6 +2906,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddBody').addEventListener('click', ()=>{
         openModal("Add body type", "Saved into vehicle_model_bodies (Title Case).", `
@@ -1925,8 +2914,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label">Body type</div>
             <input class="field mt-2" id="mBodyVal" placeholder="e.g. SUV">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveBody" type="button">Save body</button>
-              <button class="btn btnGhost" id="mCancelBody" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveBody" type="button">Save body${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelBody" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -1959,7 +2948,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       const top = document.createElement('div');
       top.className = 'flex items-center justify-between gap-2 flex-wrap';
-      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddTown">+ Add town</button>`;
+      top.innerHTML = `<button class="btnAdd" type="button" id="btnAddTown">Add town${ICON_ARROW_RIGHT}</button>`;
       wrap.appendChild(top);
 
       const grid = document.createElement('div');
@@ -1982,6 +2971,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddTown').addEventListener('click', ()=>{
         openModal("Add town", "Saved into towns (Title Case).", `
@@ -1989,8 +2979,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label">Town name</div>
             <input class="field mt-2" id="mTownName" placeholder="e.g. Nairobi West">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveTown" type="button">Save town</button>
-              <button class="btn btnGhost" id="mCancelTown" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveTown" type="button">Save town${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelTown" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -2017,53 +3007,17 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     }
 
     function renderPricing(){
-      setQuestion("What is the cash price?", "Enter a number once. Everything else stays tap-first.");
+      setQuestion("What is the cash price?", "Enter the amount once. Listings default to 30-day expiry with sponsorship off.");
       setBody(`
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <div class="label">Cash price (KES)</div>
-            <input class="field mt-2" id="priceKes" inputmode="numeric" placeholder="e.g. 780000" value="${state.price ?? ''}">
-          </div>
-          <div>
-            <div class="label">Optional sponsor days</div>
-            <div class="qSub mt-2">Sponsorship boosts ranking while active.</div>
-            <div class="mt-2" id="sponsorPills"></div>
-          </div>
+        <div>
+          <div class="label">Cash price (KES)</div>
+          <input class="field mt-2" id="priceKes" inputmode="numeric" placeholder="e.g. 780000" value="${state.price ?? ''}">
         </div>
-        <div class="mt-4">
-          <div class="label">Expiry days</div>
-          <div class="qSub mt-2">Listing is visible only if approved AND expires_at &gt; NOW().</div>
-          <div class="mt-2" id="expiryPills"></div>
+        <div class="infoNote mt-4">
+          <div class="infoTitle">Auto settings</div>
+          <div class="infoText">Expiry is fixed at 30 days and Sponsorship stays off for quick publishing. Adjust later in CMS if needed.</div>
         </div>
       `);
-
-      // Sponsor pills
-      const sWrap = $('sponsorPills');
-      sWrap.className = 'pillGrid';
-      const sponsorOpts = [0,7,14,30];
-      sponsorOpts.forEach(n=>{
-        const p = pillEl({id:n, title: n===0 ? 'Sponsor Off' : `Sponsor ${n} days`, sub:'Sponsorship', kind:'money', key:'sponsor-'+n, selected: state.sponsorDays===n});
-        p.addEventListener('click', ()=>{
-          selectSingleInGrid(sWrap, p);
-          state.sponsorDays = n;
-          updateSummary();
-        });
-        sWrap.appendChild(p);
-      });
-
-      // Expiry pills
-      const eWrap = $('expiryPills');
-      eWrap.className = 'pillGrid';
-      const expiryOpts = [30,60,90];
-      expiryOpts.forEach(n=>{
-        const p = pillEl({id:n, title: `${n} days`, sub:'Expiry', kind:'tag', key:'expiry-'+n, selected: state.expiryDays===n});
-        p.addEventListener('click', ()=>{
-          selectSingleInGrid(eWrap, p);
-          state.expiryDays = n;
-          updateSummary();
-        });
-        eWrap.appendChild(p);
-      });
 
       $('priceKes').addEventListener('input', ()=>{
         const v = $('priceKes').value.replace(/[^\d]/g,'');
@@ -2073,80 +3027,24 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       });
     }
 
-    function renderSpecs(){
-      setQuestion("Basic specs", "Enter engine and mileage. Then pick fuel, transmission, and color with taps.");
-      const fuelOpts = [
-        {v:'petrol', t:'Petrol', k:'fuel', kind:'fuel'},
-        {v:'diesel', t:'Diesel', k:'fuel', kind:'fuel'},
-        {v:'hybrid', t:'Hybrid', k:'fuel', kind:'fuel'},
-        {v:'electric', t:'Electric', k:'fuel', kind:'fuel'},
-        {v:'other', t:'Other', k:'fuel', kind:'fuel'},
-      ];
-      const transOpts = [
-        {v:'automatic', t:'Automatic', kind:'trans'},
-        {v:'manual', t:'Manual', kind:'trans'},
-        {v:'other', t:'Other', kind:'trans'},
-      ];
-
-      const colors = [
-        "White","Black","Silver","Grey","Blue","Red","Green","Beige","Brown","Gold","Orange","Purple"
-      ];
-
+    function renderEngineStep(){
+      setQuestion("Engine & mileage", "Enter at least the engine capacity.");
       const wrap = document.createElement('div');
-
       wrap.innerHTML = `
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <div class="label">Engine (cc)</div>
-            <input class="field mt-2" id="engineCc" inputmode="numeric" placeholder="e.g. 1500" value="${state.engine ?? ''}">
-          </div>
-          <div>
-            <div class="label">Mileage (km, optional)</div>
-            <input class="field mt-2" id="mileageKm" inputmode="numeric" placeholder="e.g. 112000" value="${state.mileage ?? ''}">
-          </div>
-        </div>
-
-        <div class="mt-5">
-          <div class="label">Fuel type</div>
-          <div class="mt-2 pillGrid" id="fuelGrid"></div>
-        </div>
-
-        <div class="mt-5">
-          <div class="label">Transmission</div>
-          <div class="mt-2 pillGrid" id="transGrid"></div>
-        </div>
-
-        <div class="mt-5">
-          <div class="flex items-center justify-between gap-2 flex-wrap">
+        <div class="specSection">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <div class="label">Color</div>
-              <div class="qSub mt-1">Tap a color or add your own.</div>
+              <div class="label">Engine (cc)</div>
+              <input class="field mt-2" id="engineCc" inputmode="numeric" placeholder="e.g. 1500" value="${state.engine ?? ''}">
             </div>
-            <button class="btnAdd" type="button" id="btnAddColor">+ Add custom color</button>
-          </div>
-          <div class="mt-2 pillGrid" id="colorGrid"></div>
-        </div>
-
-        <div class="mt-5 hr"></div>
-
-        <div class="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <div class="label">Title (optional)</div>
-            <input class="field mt-2" id="title" placeholder="Auto-generated if blank" value="${escapeHtml(state.title || '')}">
-          </div>
-          <div>
-            <div class="label">Trim (optional)</div>
-            <input class="field mt-2" id="trim" placeholder="e.g. G, RS, XLE" value="${escapeHtml(state.trim || '')}">
-          </div>
-          <div class="md:col-span-2">
-            <div class="label">Description (optional)</div>
-            <textarea class="field mt-2" id="desc" rows="3" placeholder="Optional notes...">${escapeHtml(state.description || '')}</textarea>
+            <div>
+              <div class="label">Mileage (optional)</div>
+              <input class="field mt-2" id="mileageKm" inputmode="numeric" placeholder="e.g. 112000" value="${state.mileage ?? ''}">
+            </div>
           </div>
         </div>
       `;
       setBodyNode(wrap);
-
-      // Engine/mileage
       $('engineCc').addEventListener('input', ()=>{
         const v = $('engineCc').value.replace(/[^\d]/g,'');
         $('engineCc').value = v;
@@ -2159,55 +3057,123 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         state.mileage = v ? Number(v) : null;
         updateSummary();
       });
+    }
 
-      // Fuel pills
+    function renderFuelStep(){
+      setQuestion("Fuel type", "Tap one option. Add more in settings later.");
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <div class="specSection">
+          <div class="label">Fuel type</div>
+          <div class="mt-2 pillGrid" id="fuelGrid"></div>
+        </div>
+      `;
+      setBodyNode(wrap);
+      const fuelOpts = [
+        {v:'petrol', t:'Petrol', k:'fuel', kind:'fuel'},
+        {v:'diesel', t:'Diesel', k:'fuel', kind:'fuel'},
+        {v:'hybrid', t:'Hybrid', k:'fuel', kind:'fuel'},
+        {v:'electric', t:'Electric', k:'fuel', kind:'fuel'},
+        {v:'other', t:'Other', k:'fuel', kind:'fuel'},
+      ];
       const fg = $('fuelGrid');
       fuelOpts.forEach(o=>{
-        const p = pillEl({id:o.v, title:o.t, sub:'Fuel', kind:o.kind, key:'fuel-'+o.v, selected: state.fuel===o.v});
+        const p = pillEl({id:o.v, title:o.t, sub:'Tap to select', kind:o.kind, key:'fuel-'+o.v, selected: state.fuel===o.v});
         p.addEventListener('click', ()=>{
           selectSingleInGrid(fg, p);
           state.fuel = o.v;
           updateSummary();
+          next();
         });
         fg.appendChild(p);
       });
+      ensureStepAdvanceFallback(fg, ()=> next());
+    }
 
-      // Transmission pills
+    function renderTransmissionStep(){
+      setQuestion("Transmission", "Choose what the gearbox is.");
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <div class="specSection">
+          <div class="label">Transmission</div>
+          <div class="mt-2 pillGrid" id="transGrid"></div>
+        </div>
+      `;
+      setBodyNode(wrap);
+      const transOpts = [
+        {v:'automatic', t:'Automatic', kind:'trans'},
+        {v:'manual', t:'Manual', kind:'trans'},
+        {v:'other', t:'Other', kind:'trans'},
+      ];
       const tg = $('transGrid');
       transOpts.forEach(o=>{
-        const p = pillEl({id:o.v, title:o.t, sub:'Transmission', kind:o.kind, key:'trans-'+o.v, selected: state.trans===o.v});
+        const p = pillEl({id:o.v, title:o.t, sub:'Tap to select', kind:o.kind, key:'trans-'+o.v, selected: state.trans===o.v});
         p.addEventListener('click', ()=>{
           selectSingleInGrid(tg, p);
           state.trans = o.v;
           updateSummary();
+          next();
         });
         tg.appendChild(p);
       });
+      ensureStepAdvanceFallback(tg, ()=> next());
+    }
 
-      // Color pills
+    function renderColorStep(){
+      setQuestion("Color", "Tap a color swatch or add your own.");
+      const colors = [
+        "White","Black","Silver","Grey","Blue","Red","Green","Beige","Brown","Gold","Orange","Purple"
+      ];
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <div class="specSection">
+          <div class="flex items-center justify-between gap-2 flex-wrap">
+            <div>
+              <div class="label">Body color</div>
+              <div class="qSub mt-1">Applies to listing card and preview.</div>
+            </div>
+            <button class="btnAdd" type="button" id="btnAddColor">Add custom color${ICON_ARROW_RIGHT}</button>
+          </div>
+          <div class="mt-2 colorSwatchGrid" id="colorGrid"></div>
+        </div>
+      `;
+      setBodyNode(wrap);
       const cg = $('colorGrid');
       function renderColors(arr){
         cg.innerHTML = '';
         arr.forEach(c=>{
-          const p = pillEl({id:c, title:c, sub:'Color', kind:'palette', key:'color-'+c, selected: state.color===c});
-          p.addEventListener('click', ()=>{
-            selectSingleInGrid(cg, p);
+          const sw = document.createElement('button');
+          sw.type = 'button';
+          sw.className = 'colorSwatch';
+          sw.setAttribute('aria-selected', state.color===c ? 'true':'false');
+          const cssColor = colorValueFromName(c);
+          const ink = isLightColor(cssColor) ? '#0f172a' : '#f8fafc';
+          sw.style.setProperty('--swatch-color', cssColor);
+          sw.style.setProperty('--swatch-ink', ink);
+          sw.innerHTML = `
+            <div class="colorSwatchMeta">
+              <div class="colorName">${escapeHtml(c)}</div>
+              <div class="colorHint">${state.color===c ? 'Selected' : 'Tap to select'}</div>
+            </div>
+          `;
+          sw.addEventListener('click', ()=>{
             state.color = c;
+            renderColors(arr);
             updateSummary();
+            next();
           });
-          cg.appendChild(p);
+          cg.appendChild(sw);
         });
       }
       renderColors(colors);
-
       $('btnAddColor').addEventListener('click', ()=>{
-        openModal("Add color", "This is stored only in the listing (Title Case).", `
+        openModal("Add color", "Stored only on this listing.", `
           <div>
             <div class="label">Color</div>
             <input class="field mt-2" id="mColorVal" placeholder="e.g. Pearl White">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveColor" type="button">Use color</button>
-              <button class="btn btnGhost" id="mCancelColor" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveColor" type="button">Use color${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelColor" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -2215,7 +3181,6 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         $('mSaveColor').addEventListener('click', ()=>{
           const v = $('mColorVal').value.trim();
           if (!v){ toast("Color required", "Enter a color name."); return; }
-          // mimic title case client-side for display; server will enforce title-case for color too
           const tc = v.split(/\s+/).map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
           closeModal();
           if (!colors.includes(tc)) colors.unshift(tc);
@@ -2225,11 +3190,76 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           toast("Color selected", tc);
         });
       });
+      ensureStepAdvanceFallback(cg, ()=> next());
+    }
 
-      // Optional text fields
-      $('title').addEventListener('input', ()=>{ state.title = $('title').value; });
-      $('trim').addEventListener('input', ()=>{ state.trim = $('trim').value; });
-      $('desc').addEventListener('input', ()=>{ state.description = $('desc').value; });
+    function renderExtrasStep(){
+      setQuestion("Extras", "Add optional text to enrich the listing.");
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <div class="specSection">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <div class="label">Title (optional)</div>
+              <input class="field mt-2" id="title" placeholder="${escapeHtml(autoTitle())}" value="${escapeHtml(state.title || autoTitle())}">
+            </div>
+            <div>
+              <div class="label">Trim (optional)</div>
+              <input class="field mt-2" id="trim" placeholder="e.g. G, RS, XLE" value="${escapeHtml(state.trim || '')}">
+            </div>
+            <div class="md:col-span-2">
+              <div class="label">Description (optional)</div>
+              <textarea class="field mt-2" id="desc" rows="3" placeholder="Optional notes...">${escapeHtml(state.description || '')}</textarea>
+            </div>
+          </div>
+          <div class="infoNote mt-4">
+            <div class="infoTitle">Auto title</div>
+            <div class="infoText" id="autoTitlePreview">${escapeHtml(autoTitle())}</div>
+          </div>
+        </div>
+      `;
+      setBodyNode(wrap);
+      $('title').addEventListener('input', ()=>{
+        state.title = $('title').value;
+        const preview = $('autoTitlePreview');
+        if (preview) preview.textContent = autoTitle();
+        updateSummary();
+      });
+      $('trim').addEventListener('input', ()=>{
+        state.trim = $('trim').value;
+        updateSummary();
+      });
+      $('desc').addEventListener('input', ()=>{
+        state.description = $('desc').value;
+        updateSummary();
+      });
+    }
+
+    function renderConditionStep(){
+      setQuestion("Condition", "Used vs new for schema clarity.");
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <div class="specSection">
+          <div class="label">Condition</div>
+          <div class="mt-2 pillGrid" id="condGrid"></div>
+        </div>
+      `;
+      setBodyNode(wrap);
+      const condOpts = [
+        {v:'used', t:'Used', sub:'Most listings', kind:'car'},
+        {v:'new', t:'New', sub:'Showroom', kind:'shield'},
+      ];
+      const cg = $('condGrid');
+      condOpts.forEach(o=>{
+        const p = pillEl({id:o.v, title:o.t, sub:o.sub, kind:'car', key:'cond-'+o.v, selected: state.condition===o.v});
+        p.addEventListener('click', ()=>{
+          selectSingleInGrid(cg, p);
+          state.condition = o.v;
+          updateSummary();
+          next();
+        });
+        cg.appendChild(p);
+      });
     }
 
     function renderSale(){
@@ -2242,34 +3272,21 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
         <div class="mt-5" id="hpBox" style="display:none;">
           <div class="label">Hire purchase terms</div>
-          <div class="qSub mt-2">Store only ranges (schema: listing_hp_terms). No amortization schedule.</div>
+          <div class="qSub mt-2">Store a single deposit and tenor. Preview repayment on the live card.</div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
             <div>
-              <div class="label">Min deposit (KES)</div>
-              <input class="field mt-2" id="hpMinDep" inputmode="numeric" placeholder="e.g. 200000" value="${state.hp.minDeposit ?? ''}">
+              <div class="label">Deposit (KES)</div>
+              <input class="field mt-2" id="hpDeposit" inputmode="numeric" placeholder="e.g. 200000" value="${state.hp.deposit ?? ''}">
             </div>
             <div>
-              <div class="label">Max deposit (optional)</div>
-              <input class="field mt-2" id="hpMaxDep" inputmode="numeric" placeholder="Optional" value="${state.hp.maxDeposit ?? ''}">
-            </div>
-            <div>
-              <div class="label">Min months</div>
-              <input class="field mt-2" id="hpMinMo" inputmode="numeric" placeholder="3" value="${state.hp.minMonths ?? 3}">
-            </div>
-            <div>
-              <div class="label">Max months</div>
-              <input class="field mt-2" id="hpMaxMo" inputmode="numeric" placeholder="60" value="${state.hp.maxMonths ?? 60}">
+              <div class="label">Months</div>
+              <input class="field mt-2" id="hpMonths" inputmode="numeric" placeholder="12" value="${state.hp.months ?? 12}">
             </div>
             <div class="md:col-span-2">
               <div class="label">HP notes (optional)</div>
               <input class="field mt-2" id="hpNotes" placeholder="Optional" value="${escapeHtml(state.hp.notes || '')}">
             </div>
           </div>
-        </div>
-
-        <div class="mt-5">
-          <div class="label">Condition</div>
-          <div class="mt-2 pillGrid" id="condGrid"></div>
         </div>
       `;
       setBodyNode(wrap);
@@ -2312,28 +3329,20 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           el.value = v;
         });
       };
-      clampNum('hpMinDep'); clampNum('hpMaxDep'); clampNum('hpMinMo'); clampNum('hpMaxMo');
-      $('hpMinDep').addEventListener('input', ()=> state.hp.minDeposit = $('hpMinDep').value ? Number($('hpMinDep').value) : null);
-      $('hpMaxDep').addEventListener('input', ()=> state.hp.maxDeposit = $('hpMaxDep').value ? Number($('hpMaxDep').value) : null);
-      $('hpMinMo').addEventListener('input', ()=> state.hp.minMonths = $('hpMinMo').value ? Number($('hpMinMo').value) : 3);
-      $('hpMaxMo').addEventListener('input', ()=> state.hp.maxMonths = $('hpMaxMo').value ? Number($('hpMaxMo').value) : 60);
-      $('hpNotes').addEventListener('input', ()=> state.hp.notes = $('hpNotes').value);
-
-      // condition
-      const cg = $('condGrid');
-      const condOpts = [
-        {v:'used', t:'Used', sub:'Most listings', kind:'car'},
-        {v:'new', t:'New', sub:'Showroom', kind:'shield'},
-      ];
-      condOpts.forEach(o=>{
-        const p = pillEl({id:o.v, title:o.t, sub:o.sub, kind:'car', key:'cond-'+o.v, selected: state.condition===o.v});
-        p.addEventListener('click', ()=>{
-          selectSingleInGrid(cg, p);
-          state.condition = o.v;
-          updateSummary();
-        });
-        cg.appendChild(p);
+      clampNum('hpDeposit'); clampNum('hpMonths');
+      $('hpDeposit').addEventListener('input', ()=>{
+        state.hp.deposit = $('hpDeposit').value ? Number($('hpDeposit').value) : null;
+        updateSummary();
       });
+      $('hpMonths').addEventListener('input', ()=>{
+        state.hp.months = $('hpMonths').value ? Number($('hpMonths').value) : 12;
+        updateSummary();
+      });
+      $('hpNotes').addEventListener('input', ()=>{
+        state.hp.notes = $('hpNotes').value;
+        updateSummary();
+      });
+
     }
 
     function renderFeatures(){
@@ -2341,14 +3350,16 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       const wrap = document.createElement('div');
 
       wrap.innerHTML = `
-        <div class="flex items-center justify-between gap-2 flex-wrap">
-          <div>
-            <div class="label">Features</div>
-            <div class="qSub mt-1">Multi-select pills. Stored as JSON array in listings.features.</div>
+        <div class="specSection">
+          <div class="flex items-center justify-between gap-2 flex-wrap">
+            <div>
+              <div class="label">Features</div>
+              <div class="qSub mt-1">Multi-select quick highlights.</div>
+            </div>
+            <button class="btnAdd" type="button" id="btnAddFeature">Add feature${ICON_ARROW_RIGHT}</button>
           </div>
-          <button class="btnAdd" type="button" id="btnAddFeature">+ Add feature</button>
+          <div class="mt-3 pillGrid" id="featGrid"></div>
         </div>
-        <div class="mt-4 pillGrid" id="featGrid"></div>
       `;
       setBodyNode(wrap);
 
@@ -2358,7 +3369,9 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
       state.features.forEach(f=>{
         const sel = selected.has(f.tag);
-        const p = pillEl({id:f.tag, title:f.label || f.tag, sub:'Feature', kind:'tag', key:'feat-'+f.tag, selected: sel});
+        const p = pillEl({id:f.tag, title:f.label || f.tag, sub:'', kind:'tag', key:'feat-'+f.tag, selected: sel});
+        const hint = p.querySelector('.s');
+        if (hint) hint.remove();
         p.addEventListener('click', ()=>{
           const cur = p.getAttribute('aria-selected') === 'true';
           p.setAttribute('aria-selected', cur ? 'false' : 'true');
@@ -2368,6 +3381,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         });
         g.appendChild(p);
       });
+      ensureStepAdvanceFallback(g, ()=> next());
 
       $('btnAddFeature').addEventListener('click', ()=>{
         openModal("Add feature", "Saved into settings[pipii_features] (Title Case label).", `
@@ -2377,8 +3391,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
             <div class="label mt-4">Tag (optional)</div>
             <input class="field mt-2" id="mFeatTag" placeholder="e.g. reverse_camera">
             <div class="mt-4 flex gap-2">
-              <button class="btn btnSolid" id="mSaveFeat" type="button">Save feature</button>
-              <button class="btn btnGhost" id="mCancelFeat" type="button">Cancel</button>
+              <button class="btn btnSolid" id="mSaveFeat" type="button">Save feature${ICON_ARROW_RIGHT}</button>
+              <button class="btn btnGhost" id="mCancelFeat" type="button">Cancel${ICON_ARROW_LEFT}</button>
             </div>
           </div>
         `);
@@ -2415,8 +3429,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="qSub">Tip: Add at least 3 for a strong listing.</div>
           <div class="flex gap-2">
-            <button class="btnAdd" type="button" id="btnPickPhotos">+ Add photos</button>
-            <button class="btn btnGhost" type="button" id="btnClearPhotos">Clear</button>
+            <button class="btnAdd" type="button" id="btnPickPhotos">Add photos${ICON_ARROW_RIGHT}</button>
+            <button class="btn btnGhost" type="button" id="btnClearPhotos">Clear${ICON_ARROW_LEFT}</button>
           </div>
         </div>
 
@@ -2452,11 +3466,16 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           });
           g.appendChild(d);
         });
+        if (!state.photos.length) previewSlideIndex = 0;
         updateSummary();
       }
       function addFiles(fileList){
         const files = Array.from(fileList || []).filter(f=>f && f.type && f.type.startsWith('image/'));
-        files.forEach(f=> state.photos.push({ file: f, url: URL.createObjectURL(f) }));
+        files.forEach((f, i)=>{
+          const obj = { file: f, url: URL.createObjectURL(f) };
+          state.photos.push(obj);
+          if (state.photos.length === files.length && i === 0) previewSlideIndex = 0;
+        });
         renderGrid();
       }
 
@@ -2538,8 +3557,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           <div class="mt-4 hr"></div>
 
           <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-            <button class="btn btnGhost" type="button" id="btnReviewBack">Go back</button>
-            <button class="btn btnSolid" type="button" id="btnListNow">List now</button>
+            <button class="btn btnGhost" type="button" id="btnReviewBack">Go back<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M12 5l-5 5 5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+            <button class="btn btnSolid" type="button" id="btnListNow">List now<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
           </div>
         </div>
       `;
@@ -2556,6 +3575,8 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           if (!state.year) throw new Error("Year is required");
           if (!state.engine) throw new Error("Engine (cc) is required");
           if (!state.price) throw new Error("Price is required");
+
+          await confirmDealerPublish(state.dealer.full_name || '');
 
           const fd = new FormData();
           fd.append('dealer_id', state.dealer.id);
@@ -2575,7 +3596,7 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
 
           fd.append('condition_type', state.condition || 'used');
 
-          fd.append('title', state.title || '');
+          fd.append('title', state.title || autoTitle());
           fd.append('trim', state.trim || '');
           fd.append('description', state.description || '');
 
@@ -2587,14 +3608,13 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           fd.append('features', JSON.stringify(state.selectedFeatures || []));
 
           fd.append('hp_on', state.sale.hp ? '1' : '0');
-          fd.append('hp_min_deposit', state.hp.minDeposit ? String(state.hp.minDeposit) : '');
-          fd.append('hp_max_deposit', state.hp.maxDeposit ? String(state.hp.maxDeposit) : '');
-          fd.append('hp_min_months', String(state.hp.minMonths || 3));
-          fd.append('hp_max_months', String(state.hp.maxMonths || 60));
+          const hpDepositVal = state.hp.deposit ? String(state.hp.deposit) : '';
+          const hpMonthsVal = state.hp.months ? String(state.hp.months) : '';
+          fd.append('hp_min_deposit', hpDepositVal);
+          fd.append('hp_max_deposit', hpDepositVal);
+          fd.append('hp_min_months', hpMonthsVal || '3');
+          fd.append('hp_max_months', hpMonthsVal || '3');
           fd.append('hp_notes', state.hp.notes || '');
-
-          fd.append('expiry_days', String(state.expiryDays || 30));
-          fd.append('sponsor_days', String(state.sponsorDays || 0));
 
           state.photos.forEach(p=> fd.append('photos[]', p.file, p.file.name));
 
@@ -2607,7 +3627,11 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
           setProgress();
           fadeTo(()=>renderCurrent());
         }catch(e){
-          toast("Cannot list", e.message);
+          if (e && e.message === PUBLISH_CANCELLED){
+            toast("Publish cancelled", "Listing was not saved.");
+            return;
+          }
+          toast("Cannot list", e?.message || 'Unknown error');
         }
       });
     }
@@ -2616,6 +3640,24 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
     function selectSingleInGrid(grid, selectedEl){
       [...grid.children].forEach(ch=> ch.setAttribute('aria-selected','false'));
       selectedEl.setAttribute('aria-selected','true');
+    }
+    function ensureStepAdvanceFallback(grid, advanceFn){
+      if (!grid) return;
+      setTimeout(()=>{
+        if (grid.children.length > 0) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btnSolid';
+        btn.innerHTML = `Next step<span class="btnIconTail" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M8 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>`;
+        btn.addEventListener('click', advanceFn);
+        grid.parentElement?.appendChild(btn);
+      }, 0);
+    }
+    function changePreviewSlide(delta){
+      const total = state.photos.length;
+      if (!total) return;
+      previewSlideIndex = (previewSlideIndex + delta + total) % total;
+      updatePreviewMedia();
     }
 
     function renderCurrent(){
@@ -2632,7 +3674,12 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (step === "body") return renderBody();
       if (step === "town") return renderTown();
       if (step === "pricing") return renderPricing();
-      if (step === "specs") return renderSpecs();
+      if (step === "engine") return renderEngineStep();
+      if (step === "fuel") return renderFuelStep();
+      if (step === "trans") return renderTransmissionStep();
+      if (step === "color") return renderColorStep();
+      if (step === "extras") return renderExtrasStep();
+      if (step === "condition") return renderConditionStep();
       if (step === "sale") return renderSale();
       if (step === "features") return renderFeatures();
       if (step === "photos") return renderPhotos();
@@ -2649,9 +3696,14 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       if (step === "body") return true; // body can be optional in schema, but better if provided
       if (step === "town") return !!state.town;
       if (step === "pricing") return !!state.price;
-      if (step === "specs") return !!state.engine; // minimum for schema
+      if (step === "engine") return !!state.engine;
+      if (step === "fuel") return true;
+      if (step === "trans") return true;
+      if (step === "color") return true;
+      if (step === "extras") return true;
+      if (step === "condition") return true;
       if (step === "sale") {
-        if (state.sale.hp && !state.hp.minDeposit) return false;
+        if (state.sale.hp && (!state.hp.deposit || !state.hp.months)) return false;
         return true;
       }
       if (step === "features") return true;
@@ -2701,16 +3753,14 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
       state.condition = "used";
 
       state.sale = {cash:true, hp:false, trade:false, external:false};
-      state.hp = {minDeposit:null, maxDeposit:null, minMonths:3, maxMonths:60, notes:''};
+      state.hp = {deposit:null, months:12, notes:''};
 
       state.selectedFeatures = [];
       state.photos = [];
-      state.expiryDays = 30;
-      state.sponsorDays = 0;
-
       state.title = '';
       state.trim = '';
       state.description = '';
+      previewSlideIndex = 0;
 
       if (showToast) toast("Reset", "All selections cleared.");
       updateSummary();
@@ -2768,3 +3818,22 @@ if ($isApi) json_out(["ok"=>false,"error"=>"Unknown action"], 404);
   </script>
 </body>
 </html>
+    .infoNote{
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.03);
+      padding: 14px;
+    }
+    .infoNote .infoTitle{
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      color: rgba(255,255,255,.65);
+    }
+    .infoNote .infoText{
+      margin-top: 6px;
+      font-size: 13px;
+      color: rgba(255,255,255,.78);
+      line-height: 1.45;
+    }
